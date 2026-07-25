@@ -15,9 +15,11 @@ from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
     PollSettings,
+    SyncSettings,
     UiSettings,
     effective_settings,
     load_settings,
+    load_sync_section_settings,
     load_ui_settings,
     merged_with_cli,
     save_settings,
@@ -166,12 +168,16 @@ class TestSettingSpecs:
         assert by_section["poll"] == {
             f.name for f in PollSettings.__dataclass_fields__.values()
         }
+        assert by_section["sync"] == {
+            f.name for f in SyncSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
             "autoswitch": AutoSwitchSettings(),
             "ui": UiSettings(),
             "poll": PollSettings(),
+            "sync": SyncSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
@@ -287,3 +293,30 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestSyncSectionSettings:
+    def test_defaults(self, tmp_path: Path):
+        s = load_sync_section_settings(tmp_path)
+        assert s.broadcast_switches is True
+        assert s.broadcast_auto_switches is False
+        assert s.follow_remote_switches is True
+
+    def test_reads_explicit_values(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "sync": {"broadcastSwitches": False, "followRemoteSwitches": False}
+        }))
+        s = load_sync_section_settings(tmp_path)
+        assert s.broadcast_switches is False
+        assert s.follow_remote_switches is False
+        assert s.broadcast_auto_switches is False
+
+    def test_mistyped_value_reverts_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "sync": {"broadcastSwitches": "yes"}
+        }))
+        assert load_sync_section_settings(tmp_path).broadcast_switches is True
+
+    def test_set_via_config(self, tmp_path: Path):
+        assert set_setting(tmp_path, "sync.broadcastAutoSwitches", "true") is True
+        assert load_sync_section_settings(tmp_path).broadcast_auto_switches is True

@@ -82,10 +82,29 @@ class PollSettings:
     budget_share: int = 0
 
 
+@dataclass(frozen=True)
+class SyncSettings:
+    """Cross-device behavior (``sync`` section).
+
+    ``broadcast_switches`` pushes a manual switch to the saved sync peers
+    the moment it lands; ``broadcast_auto_switches`` extends that to
+    switches the auto engine makes (off by default — an autoswitch reflects
+    one device's usage view, and fleet-wide churn is opt-in);
+    ``follow_remote_switches`` is the receiving side: whether this device
+    activates an account when a peer's switch arrives. A device with follow
+    off still relays peers' intent onward at sync time.
+    """
+
+    broadcast_switches: bool = True
+    broadcast_auto_switches: bool = False
+    follow_remote_switches: bool = True
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "poll": PollSettings,
+    "sync": SyncSettings,
 }
 
 
@@ -166,6 +185,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "poll", "budgetShare", "budget_share", "int", 0, 16,
             help="Devices sharing each account's usage-API budget "
             "(0 = auto: 1 + sync peers); poll intervals multiply by this",
+        ),
+        SettingSpec(
+            "sync", "broadcastSwitches", "broadcast_switches", "bool",
+            help="Push manual switches to sync peers immediately",
+        ),
+        SettingSpec(
+            "sync", "broadcastAutoSwitches", "broadcast_auto_switches", "bool",
+            help="Also push cswap auto's switches to sync peers",
+        ),
+        SettingSpec(
+            "sync", "followRemoteSwitches", "follow_remote_switches", "bool",
+            help="Adopt active-account switches pushed or synced from peers",
         ),
     )
 }
@@ -301,6 +332,32 @@ def load_poll_settings(backup_root: Path) -> PollSettings:
         )
         return default
     return PollSettings(budget_share=share)
+
+
+def load_sync_section_settings(backup_root: Path) -> SyncSettings:
+    """Load the sync section; missing/corrupt file or mistyped value → default.
+
+    Named to avoid colliding with the ``sync`` module (sync.json holds the
+    peer list; this holds the behavior toggles).
+    """
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("sync")
+    default = SyncSettings()
+    if not isinstance(section, dict):
+        return default
+    kwargs = {}
+    for spec in SETTING_SPECS.values():
+        if spec.section != "sync" or spec.kind != "bool":
+            continue
+        value = section.get(spec.json_key, spec.default)
+        if not isinstance(value, bool):
+            _logger.warning(
+                "settings.json: %s %r is not a bool; using %r",
+                spec.dotted, value, spec.default,
+            )
+            value = spec.default
+        kwargs[spec.field] = value
+    return SyncSettings(**kwargs)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -468,6 +525,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
         "poll": load_poll_settings(backup_root),
+        "sync": load_sync_section_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
