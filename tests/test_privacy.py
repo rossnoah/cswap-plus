@@ -22,7 +22,7 @@ class TestMaskEmail:
 
 class TestMaskOrg:
     def test_masks_to_first_char(self):
-        assert mask_org("Anthropic") == "A•••"
+        assert mask_org("Anthropic") == "•••"
 
     def test_personal_tag_passes_through(self):
         assert mask_org("personal") == "personal"

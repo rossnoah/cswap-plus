@@ -34,11 +34,12 @@ def mask_email(email: str, number: str | int | None = None) -> str:
 
 
 def mask_org(name: str) -> str:
-    """Org names are masked to their first character; the ``personal`` tag
-    (no org) is not identifying and passes through unchanged."""
+    """Org names are hidden entirely (no leading character — even an
+    initial can identify an employer); the ``personal`` tag (no org) is
+    not identifying and passes through unchanged."""
     if not name or name == "personal":
         return name
-    return f"{name[:1]}{MASK}"
+    return MASK
 
 
 def mask_text(text: str) -> str:
