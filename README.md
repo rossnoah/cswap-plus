@@ -1,4 +1,25 @@
-# claude-swap
+# cswap-plus
+
+A fork of [claude-swap](https://github.com/realiti4/claude-swap) that adds:
+
+- **Device sync** — `cswap sync add <ssh-host>` saves a peer; `cswap sync`
+  pulls from and pushes to every peer over SSH, reusing export/import's
+  conflict rules (dead tokens healed, healthy accounts kept unless
+  `--force`). Credentials only ever transit the SSH channel.
+- **Privacy mode** — press `p` in the TUI (or set `ui.privacy`) to mask
+  every email and org name to its first character (`n•••@g•••`), for
+  screen shares and screenshots. Slot numbers and aliases stay visible.
+- **Shared usage polling** — the usage API's request budget is per
+  account token, shared by every device that polls it. `poll.budgetShare`
+  (auto-derived from your sync peers) scales each device's poll intervals
+  so the fleet's combined rate fits one device's budget, with
+  deterministic phase stagger; `cswap sync` also trades fresh usage
+  measurements between peers so no device re-fetches what another just
+  paid for.
+
+Everything below is inherited from upstream and works unchanged.
+
+---
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
@@ -7,7 +28,7 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 ### Using uv (recommended)
 
 ```bash
-uv tool install claude-swap
+uv tool install cswap-plus
 ```
 
 ### Using pipx
