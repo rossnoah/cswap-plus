@@ -93,11 +93,22 @@ class SyncSettings:
     ``follow_remote_switches`` is the receiving side: whether this device
     activates an account when a peer's switch arrives. A device with follow
     off still relays peers' intent onward at sync time.
+
+    ``auto_sync`` is the master switch for background syncing: every
+    mechanism (the auto/menubar/TUI piggyback ticks and any OS-scheduled
+    ``cswap sync --auto`` job) re-checks it at run time, so turning it off
+    quiesces the device immediately without uninstalling anything.
+    ``heal_on_death`` is deliberately independent — repairing a
+    proven-dead credential from a peer is narrower and safer than periodic
+    syncing, so pausing auto-sync doesn't disable emergency repair.
     """
 
     broadcast_switches: bool = True
     broadcast_auto_switches: bool = False
     follow_remote_switches: bool = True
+    auto_sync: bool = True
+    auto_sync_interval_minutes: int = 15
+    heal_on_death: bool = True
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -197,6 +208,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "sync", "followRemoteSwitches", "follow_remote_switches", "bool",
             help="Adopt active-account switches pushed or synced from peers",
+        ),
+        SettingSpec(
+            "sync", "autoSync", "auto_sync", "bool",
+            help="Background-sync peers automatically (toggle: cswap sync auto on|off)",
+        ),
+        SettingSpec(
+            "sync", "autoSyncIntervalMinutes", "auto_sync_interval_minutes",
+            "int", 5, 1440,
+            help="Minutes between background syncs of the saved peers",
+        ),
+        SettingSpec(
+            "sync", "healOnDeath", "heal_on_death", "bool",
+            help="Pull a working credential from a peer when one dies here",
         ),
     )
 }
@@ -347,15 +371,27 @@ def load_sync_section_settings(backup_root: Path) -> SyncSettings:
         return default
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "sync" or spec.kind != "bool":
+        if spec.section != "sync":
             continue
         value = section.get(spec.json_key, spec.default)
-        if not isinstance(value, bool):
-            _logger.warning(
-                "settings.json: %s %r is not a bool; using %r",
-                spec.dotted, value, spec.default,
-            )
-            value = spec.default
+        if spec.kind == "bool":
+            if not isinstance(value, bool):
+                _logger.warning(
+                    "settings.json: %s %r is not a bool; using %r",
+                    spec.dotted, value, spec.default,
+                )
+                value = spec.default
+        else:  # int
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not (spec.lo <= value <= spec.hi)
+            ):
+                _logger.warning(
+                    "settings.json: invalid %s %r; using %r",
+                    spec.dotted, value, spec.default,
+                )
+                value = spec.default
         kwargs[spec.field] = value
     return SyncSettings(**kwargs)
 
