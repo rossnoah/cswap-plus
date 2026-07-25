@@ -1,7 +1,7 @@
 [project]
-name = "claude-swap"
-version = "0.23.0"
-description = "Multi-account switcher for Claude Code"
+name = "cswap-plus"
+version = "0.24.0"
+description = "Multi-account switcher for Claude Code — plus device sync, shared usage polling, and a privacy mode"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -35,13 +35,14 @@ classifiers = [
 menubar = ["rumps>=0.4.0"]
 
 [project.urls]
-Homepage = "https://github.com/realiti4/claude-swap"
-Repository = "https://github.com/realiti4/claude-swap"
-Issues = "https://github.com/realiti4/claude-swap/issues"
+Homepage = "https://github.com/rossnoah/cswap-plus"
+Repository = "https://github.com/rossnoah/cswap-plus"
+Issues = "https://github.com/rossnoah/cswap-plus/issues"
 
 [project.scripts]
 claude-swap = "claude_swap.cli:main"
 cswap = "claude_swap.cli:main"
+cswap-plus = "claude_swap.cli:main"
 
 [build-system]
 requires = ["hatchling"]
