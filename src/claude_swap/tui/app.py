@@ -95,6 +95,13 @@ class CswapApp(App):
 
     def _tick(self) -> None:
         """Start a refresh pass unless one is already in flight."""
+        try:
+            from claude_swap import sync as sync_mod
+
+            # Detached background sync piggyback; two file reads when idle.
+            sync_mod.spawn_background_autosync(self.switcher, source="tui")
+        except Exception:
+            pass
         if self._refreshing:
             return
         self._refreshing = True

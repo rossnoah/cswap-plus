@@ -492,3 +492,163 @@ class TestIntentLoopScenario:
         assert res["reason"] == "own-intent"
         # Exactly two switches happened fleet-wide.
         assert sum(n for _, _, n in applies) == 2
+
+
+class AutosyncSwitcher(FakeSwitcher):
+    def __init__(self, backup_dir):
+        super().__init__(backup_dir)
+        (backup_dir / "cache").mkdir(exist_ok=True)
+
+
+class TestMaybeAutosync:
+    def _armed(self, tmp_path):
+        sync.add_peer(tmp_path, "mm")
+        return AutosyncSwitcher(tmp_path)
+
+    def test_toggle_off_is_instant_false(self, tmp_path):
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "sync.autoSync", "false")
+        sw = self._armed(tmp_path)
+        with patch.object(sync, "sync_peers") as sp:
+            assert sync.maybe_autosync(sw, source="test") is False
+        assert not sp.called
+        assert sync.autosync_due(sw) is False
+
+    def test_no_peers_is_false(self, tmp_path):
+        sw = AutosyncSwitcher(tmp_path)
+        with patch.object(sync, "sync_peers") as sp:
+            assert sync.maybe_autosync(sw, source="test") is False
+        assert not sp.called
+
+    def test_runs_then_throttles(self, tmp_path):
+        sw = self._armed(tmp_path)
+        with patch.object(sync, "sync_peers", return_value=0) as sp:
+            assert sync.maybe_autosync(sw, source="test") is True
+            assert sp.call_args.kwargs["quiet"] is True
+            # Second call inside the interval: stamp throttles it.
+            assert sync.maybe_autosync(sw, source="test") is False
+        assert sp.call_count == 1
+        stamp = json.loads((tmp_path / "cache" / "autosync.json").read_text())
+        assert stamp["source"] == "test"
+
+    def test_runs_heal_pass(self, tmp_path):
+        sw = self._armed(tmp_path)
+        with patch.object(sync, "sync_peers", return_value=0), \
+             patch("claude_swap.heal.heal_all_dead") as had:
+            sync.maybe_autosync(sw, source="test")
+        assert had.called
+
+    def test_spawn_only_when_due(self, tmp_path):
+        sw = self._armed(tmp_path)
+        with patch.object(sync.subprocess, "Popen") as popen:
+            assert sync.spawn_background_autosync(sw, source="tui") is True
+            args = popen.call_args.args[0]
+            assert args[-3:] == ["sync", "--auto"] or args[-2:] == ["sync", "--auto"]
+        # Stamp a fresh run: not due, no spawn.
+        from claude_swap.settings import atomic_write_json
+        import time as _time
+
+        atomic_write_json(
+            tmp_path / "cache" / "autosync.json",
+            {"timestamp": _time.time(), "pid": 1},
+        )
+        with patch.object(sync.subprocess, "Popen") as popen:
+            assert sync.spawn_background_autosync(sw, source="tui") is False
+        assert not popen.called
+
+
+class TestEmitCredential:
+    def _switcher(self, tmp_path, kind="oauth"):
+        sw = IntentSwitcher(tmp_path)
+        sw.account_kind_for = lambda slot: kind
+        return sw
+
+    def test_unknown_identity_returns_none(self, tmp_path):
+        sw = self._switcher(tmp_path)
+        assert sync.emit_credential(
+            sw, {"email": "who@x.com", "organizationUuid": ""}
+        ) is None
+
+    def test_api_key_returns_none(self, tmp_path):
+        sw = self._switcher(tmp_path, kind="api_key")
+        assert sync.emit_credential(
+            sw, {"email": "a@x.com", "organizationUuid": ""}
+        ) is None
+
+    def test_known_identity_exports_slim_envelope(self, tmp_path):
+        sw = self._switcher(tmp_path)
+        with patch.object(sync, "export_accounts",
+                          side_effect=lambda s, dest, account=None, full=False:
+                          print(json.dumps({"version": 1, "account": account}))):
+            out = sync.emit_credential(
+                sw, {"email": "a@x.com", "organizationUuid": ""}
+            )
+        assert json.loads(out)["account"] == "1"
+
+    def test_malformed_request_raises(self, tmp_path):
+        sw = self._switcher(tmp_path)
+        with pytest.raises(SyncError):
+            sync.emit_credential(sw, {"email": ""})
+        with pytest.raises(SyncError):
+            sync.emit_credential(sw, ["nope"])
+
+
+class TestSyncAutoCli:
+    _run = TestSyncCli._run
+
+    def test_auto_on_off_status(self, tmp_path, capsys):
+        from claude_swap.settings import load_sync_section_settings
+
+        code, out, _ = self._run(["auto", "off"], tmp_path, capsys)
+        assert code == 0
+        assert load_sync_section_settings(tmp_path).auto_sync is False
+        code, out, _ = self._run(["auto", "on"], tmp_path, capsys)
+        assert code == 0
+        assert load_sync_section_settings(tmp_path).auto_sync is True
+        code, out, _ = self._run(["auto"], tmp_path, capsys)
+        assert code == 0
+        assert "auto-sync: on" in out
+        assert "schedule:" in out
+
+    def test_auto_bad_mode_errors(self, tmp_path, capsys):
+        code, _, err = self._run(["auto", "sideways"], tmp_path, capsys)
+        assert code == 1
+        assert "on|off|status" in err
+
+    def test_auto_flag_routes_through_maybe_autosync(self, tmp_path, capsys):
+        with patch.object(sync, "maybe_autosync", return_value=False) as ma:
+            code, out, _ = self._run(["--auto"], tmp_path, capsys)
+        assert code == 0
+        assert ma.call_args.kwargs["source"] == "schedule"
+        assert out == ""  # silent when nothing to do
+
+    def test_install_schedule_no_peers_polite_exit_0(self, tmp_path, capsys):
+        code, out, _ = self._run(["install-schedule"], tmp_path, capsys)
+        assert code == 0
+        assert "inbound pushes" in out
+
+
+class TestInstallScheduleMacos:
+    def test_writes_plist_and_loads(self, tmp_path, capsys, monkeypatch):
+        if sync.sys.platform != "darwin":
+            pytest.skip("launchd path is macOS-only")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        sync.add_peer(tmp_path, "mm")
+        sw = SimpleNamespace(backup_dir=tmp_path)
+        with patch.object(sync.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0)) as run:
+            sync.install_schedule(sw)
+        plist = tmp_path / "Library" / "LaunchAgents" / "com.claude-swap.sync.plist"
+        assert plist.exists()
+        text = plist.read_text()
+        assert "<string>sync</string>" in text
+        assert "<string>--auto</string>" in text
+        assert "StartInterval" in text
+        assert any("launchctl" in c.args[0][0] for c in run.call_args_list)
+        assert sync.schedule_installed() is True
+        with patch.object(sync.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0)):
+            sync.uninstall_schedule()
+        assert not plist.exists()

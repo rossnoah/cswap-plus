@@ -458,6 +458,14 @@ Examples:
   cswap sync ubuntu            sync one host (need not be saved)
   cswap sync --pull            only import from peers
   cswap sync --push --force    overwrite peers' accounts with ours
+  cswap sync auto on|off       toggle background auto-sync (see status too)
+  cswap sync install-schedule  OS-scheduled background sync (launchd/systemd)
+  cswap sync status            per-account credential generations + heal state
+  cswap sync heal [EMAIL]      pull a working credential for dead accounts
+
+Sync also carries the active account: switching on one device follows on
+the others (sync.followRemoteSwitches), and stale credential copies are
+freshened/healed from whichever peer holds a newer working generation.
         """,
     )
     parser.add_argument(
@@ -484,6 +492,25 @@ Examples:
         action="store_true",
         help="Push full credential/config payloads instead of the slim form",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress informational output (failures still print)",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Background invocation (used by the installed schedule): exits "
+            "silently unless sync.autoSync is on and the interval elapsed"
+        ),
+    )
+    parser.add_argument(
+        "--org",
+        metavar="UUID",
+        default=None,
+        help="Organization UUID qualifying EMAIL for 'sync heal'",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
@@ -492,7 +519,54 @@ Examples:
         _guard_root(switcher)
         root = switcher.backup_dir
 
+        if args.auto:
+            # The scheduled entry point: the toggle and the stamp decide
+            # whether anything happens; a quiesced device exits 0 silently.
+            sync_mod.maybe_autosync(switcher, source="schedule")
+            return
+
         verb = args.hosts[0] if args.hosts else None
+        if verb == "status":
+            sync_mod.print_sync_status(switcher)
+            return
+        if verb == "auto":
+            mode = args.hosts[1] if len(args.hosts) > 1 else "status"
+            if mode not in ("on", "off", "status"):
+                error(f"Error: usage: {_prog_name()} sync auto on|off|status")
+                sys.exit(1)
+            from claude_swap.settings import (
+                load_sync_section_settings,
+                set_setting,
+            )
+
+            if mode in ("on", "off"):
+                set_setting(root, "sync.autoSync", mode == "on" and "true" or "false")
+                print(f"{accent('Auto-sync')} {mode}")
+                if mode == "on" and not sync_mod.schedule_installed():
+                    print(dimmed(
+                        "No background schedule installed — it will only run "
+                        "from cswap auto / the menubar / the TUI. For a "
+                        f"reliable floor: {_prog_name()} sync install-schedule"
+                    ))
+                return
+            settings = load_sync_section_settings(root)
+            config = sync_mod.load_sync_config(root, create=False)
+            print(
+                f"auto-sync: {'on' if settings.auto_sync else 'off'} "
+                f"(every {settings.auto_sync_interval_minutes}m)"
+            )
+            print(f"peers: {', '.join(config.peers) or 'none'}")
+            print(
+                "schedule: "
+                + ("installed" if sync_mod.schedule_installed() else "not installed")
+            )
+            return
+        if verb == "install-schedule":
+            sync_mod.install_schedule(switcher)
+            return
+        if verb == "uninstall-schedule":
+            sync_mod.uninstall_schedule()
+            return
         # Internal gossip verbs, invoked over SSH by a syncing peer: dump our
         # usage measurements / merge theirs from stdin. Machine-facing output.
         if verb == "emit-usage":
@@ -510,6 +584,35 @@ Examples:
         if verb == "emit-active":
             print(sync_mod.emit_active(switcher))
             return
+        if verb == "emit-credential":
+            try:
+                payload = json.loads(sys.stdin.read())
+            except json.JSONDecodeError as exc:
+                error(f"Error: invalid credential request: {exc}")
+                sys.exit(1)
+            envelope = sync_mod.emit_credential(switcher, payload)
+            if envelope is None:
+                # Machine-readable "no donor here" — distinct from transport
+                # failure so a healing peer keeps iterating its host list.
+                sys.exit(3)
+            sys.stdout.write(envelope)
+            return
+        if verb == "heal":
+            from claude_swap import heal as heal_mod
+
+            if len(args.hosts) > 1:
+                outcomes = [
+                    heal_mod.heal_from_peers(
+                        switcher, args.hosts[1], args.org or "",
+                        quiet=args.quiet,
+                    )
+                ]
+            else:
+                outcomes = heal_mod.heal_all_dead(switcher, quiet=args.quiet)
+            if not outcomes and not args.quiet:
+                print(dimmed("Nothing to heal — no dead credentials here."))
+            failed = any(o.status == "error" for o in outcomes)
+            sys.exit(1 if failed else 0)
         if verb == "apply-active":
             try:
                 payload = json.loads(sys.stdin.read())
@@ -568,6 +671,7 @@ Examples:
             push=not args.pull,
             force=args.force,
             full=args.full,
+            quiet=args.quiet,
         )
         if failures:
             sys.exit(1)

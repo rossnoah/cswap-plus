@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -24,18 +25,22 @@ import sys
 import tempfile
 import time
 import uuid
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import active_intent
 from claude_swap.exceptions import SyncError
+from claude_swap.locking import FileLock
 from claude_swap.printer import accent, dimmed, warning
 from claude_swap.settings import atomic_write_json
 from claude_swap.transfer import export_accounts, import_accounts
 
 SYNC_FILENAME = "sync.json"
 SCHEMA_VERSION = 1
+
+_logger = logging.getLogger("claude-swap")
 
 # Non-interactive SSH commonly skips the profile that puts ~/.local/bin
 # (the uv tool dir) on PATH, so spell it out on the remote side.
@@ -267,6 +272,29 @@ def gossip_usage(switcher, host: str, *, pull: bool, push: bool) -> None:
         warning(f"  usage gossip with {host} skipped: {exc}")
 
 
+def emit_credential(switcher, payload: object) -> str | None:
+    """A single-account slim envelope for a heal-requesting peer, or None
+    when this device can't donate (identity unknown here, or an API key —
+    nothing rotates, nothing to heal). The identity arrives on stdin, never
+    in argv: ``_run_remote`` builds a remote shell string, so argv-borne
+    emails would be a quoting/injection surface.
+    """
+    if not isinstance(payload, dict):
+        raise SyncError("unrecognized credential request")
+    email = payload.get("email")
+    org_uuid = payload.get("organizationUuid") or ""
+    if not isinstance(email, str) or not email or not isinstance(org_uuid, str):
+        raise SyncError("unrecognized credential request")
+    data = switcher._get_sequence_data() or {}
+    slot = switcher._find_account_slot(data, email, org_uuid)
+    if slot is None or switcher.account_kind_for(slot) == "api_key":
+        return None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        export_accounts(switcher, "-", account=slot)
+    return buf.getvalue()
+
+
 # --- Active-account intent: broadcast on switch, gossip at sync time ------
 
 _BROADCAST_TIMEOUT_S = 15
@@ -453,23 +481,451 @@ def sync_peers(
     push: bool = True,
     force: bool = False,
     full: bool = False,
+    quiet: bool = False,
 ) -> int:
     """Sync each host in turn; one failing peer never blocks the rest.
 
-    Returns the number of peers that failed.
+    Returns the number of peers that failed. ``quiet`` (background runs)
+    routes the per-host chatter to the logger; failures always reach the
+    real stderr.
     """
     failures = 0
     for host in hosts:
-        print(f"{accent('Syncing')} {host}")
+        if not quiet:
+            print(f"{accent('Syncing')} {host}")
+        buf = io.StringIO()
+        # In quiet mode capture the whole per-host conversation (including
+        # import's stderr lines) and log it instead of printing.
+        quiet_ctx = (
+            contextlib.ExitStack()
+            if not quiet
+            else _quiet_capture(buf)
+        )
         try:
-            if pull:
-                pull_from_peer(switcher, host, force=force)
-            if push:
-                push_to_peer(switcher, host, force=force, full=full)
-            gossip_usage(switcher, host, pull=pull, push=push)
-            # After account pull/push so a just-delivered account resolves.
-            gossip_active(switcher, host, pull=pull, push=push)
+            with quiet_ctx:
+                if pull:
+                    pull_from_peer(switcher, host, force=force)
+                if push:
+                    push_to_peer(switcher, host, force=force, full=full)
+                gossip_usage(switcher, host, pull=pull, push=push)
+                # After account pull/push so a just-delivered account resolves.
+                gossip_active(switcher, host, pull=pull, push=push)
         except SyncError as exc:
             warning(f"  {exc}")
             failures += 1
+        if quiet and buf.getvalue().strip():
+            for line in buf.getvalue().strip().splitlines():
+                _logger.info("autosync %s: %s", host, line.strip())
     return failures
+
+
+def _quiet_capture(buf: io.StringIO):
+    stack = contextlib.ExitStack()
+    stack.enter_context(contextlib.redirect_stdout(buf))
+    stack.enter_context(contextlib.redirect_stderr(buf))
+    return stack
+
+
+# --- Background auto-sync: toggleable, stamp-throttled --------------------
+#
+# One master switch (sync.autoSync) is re-read at run time by every
+# mechanism — the piggyback spawns from the engine/menubar/TUI ticks and
+# the OS-scheduled `cswap sync --auto` job — so `cswap sync auto off`
+# quiesces a device immediately without uninstalling anything. The stamp
+# file is both the throttle and the mutex (claim-by-stamp: a crashed run
+# costs one interval, never a deadlock).
+
+AUTOSYNC_STAMP = "autosync.json"
+
+
+def _autosync_paths(backup_root: Path) -> tuple[Path, FileLock]:
+    cache = backup_root / "cache"
+    return cache / AUTOSYNC_STAMP, FileLock(cache / ".autosync.lock")
+
+
+def _effective_interval_s(backup_root: Path, config: SyncConfig) -> float:
+    from claude_swap.settings import load_sync_section_settings
+
+    minutes = load_sync_section_settings(backup_root).auto_sync_interval_minutes
+    # Deterministic per-device phase (±60s) so the fleet never syncs in
+    # lockstep, plus a small random jitter per check.
+    phase = (zlib.crc32(config.device_id.encode()) % 121) - 60
+    import random
+
+    return minutes * 60 + phase + (random.random() - 0.5) * 0.2 * minutes * 60
+
+
+def autosync_due(switcher) -> bool:
+    """Cheap read-only check: toggle on, peers exist, interval elapsed."""
+    from claude_swap.settings import load_sync_section_settings
+
+    backup_root = switcher.backup_dir
+    if not load_sync_section_settings(backup_root).auto_sync:
+        return False
+    config = load_sync_config(backup_root, create=False)
+    if not config.peers:
+        return False
+    stamp_path, _ = _autosync_paths(backup_root)
+    try:
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        last = float(stamp.get("timestamp") or 0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        last = 0.0
+    return time.time() - last >= _effective_interval_s(backup_root, config)
+
+
+def maybe_autosync(switcher, *, source: str) -> bool:
+    """Run one quiet background sync if the toggle and throttle allow.
+
+    Claim-by-stamp under the lock, then the sync itself with no lock held.
+    Returns True when a sync actually ran.
+    """
+    try:
+        from claude_swap.settings import load_sync_section_settings
+
+        backup_root = switcher.backup_dir
+        if not load_sync_section_settings(backup_root).auto_sync:
+            return False
+        config = load_sync_config(backup_root, create=False)
+        if not config.peers:
+            return False
+        stamp_path, lock = _autosync_paths(backup_root)
+        now = time.time()
+        with lock:
+            try:
+                stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+                last = float(stamp.get("timestamp") or 0)
+            except (OSError, ValueError, json.JSONDecodeError):
+                last = 0.0
+            if now - last < _effective_interval_s(backup_root, config):
+                return False
+            atomic_write_json(
+                stamp_path,
+                {"timestamp": now, "pid": os.getpid(), "source": source},
+            )
+        _logger.info("autosync (%s): syncing %s", source, ", ".join(config.peers))
+        failures = sync_peers(switcher, list(config.peers), quiet=True)
+        try:
+            from claude_swap import heal
+
+            heal.heal_all_dead(switcher, quiet=True)
+        except Exception as exc:
+            _logger.info("autosync heal pass skipped: %s", exc)
+        _logger.info("autosync (%s): done, %d peer failure(s)", source, failures)
+        return True
+    except Exception as exc:
+        _logger.warning("autosync (%s) failed: %s", source, exc)
+        return False
+
+
+def spawn_background_autosync(switcher, *, source: str) -> bool:
+    """Detach a `cswap sync --auto` run when one is due.
+
+    The piggyback entry point for interactive surfaces (menubar timer, TUI
+    tick) and the engine loop: the due-check is a couple of file reads, and
+    the sync itself never blocks the calling surface.
+    """
+    try:
+        if not autosync_due(switcher):
+            return False
+        subprocess.Popen(
+            [sys.executable, "-m", "claude_swap", "sync", "--auto"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as exc:
+        _logger.info("autosync spawn (%s) skipped: %s", source, exc)
+        return False
+
+
+# --- OS scheduler: the reliability floor when no cswap surface runs -------
+
+LAUNCHD_LABEL = "com.claude-swap.sync"
+_CRON_MARK = "# cswap-autosync"
+
+
+def _cswap_executable() -> str:
+    import shutil
+
+    found = shutil.which("cswap")
+    if found:
+        return found
+    return os.path.abspath(sys.argv[0])
+
+
+def _launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def _systemd_unit_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def schedule_installed() -> bool:
+    if sys.platform == "darwin":
+        return _launchd_plist_path().exists()
+    unit = _systemd_unit_dir() / "cswap-sync.timer"
+    if unit.exists():
+        return True
+    try:
+        proc = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=10
+        )
+        return _CRON_MARK in (proc.stdout or "")
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def install_schedule(switcher) -> None:
+    """Install the platform's background `cswap sync --auto` job.
+
+    The job is deliberately dumb: it fires every interval and lets the
+    toggle + stamp inside `--auto` decide whether anything happens, so
+    `cswap sync auto off` quiesces it without touching the scheduler.
+    """
+    from claude_swap.settings import load_sync_section_settings
+
+    backup_root = switcher.backup_dir
+    config = load_sync_config(backup_root, create=False)
+    if not config.peers:
+        print(dimmed(
+            "No sync peers — this device is healed by inbound pushes; "
+            "nothing to schedule."
+        ))
+        return
+    interval_s = (
+        load_sync_section_settings(backup_root).auto_sync_interval_minutes * 60
+    )
+    stagger = zlib.crc32(config.device_id.encode()) % 120
+    cswap = _cswap_executable()
+    log_dir = backup_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if sys.platform == "darwin":
+        plist = _launchd_plist_path()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{cswap}</string>
+    <string>sync</string>
+    <string>--auto</string>
+  </array>
+  <key>StartInterval</key><integer>{interval_s + stagger}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{log_dir / "autosync.log"}</string>
+  <key>StandardErrorPath</key><string>{log_dir / "autosync.log"}</string>
+</dict>
+</plist>
+""")
+        loaded = False
+        for cmd in (
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+            ["launchctl", "load", "-w", str(plist)],
+        ):
+            try:
+                if subprocess.run(cmd, capture_output=True, timeout=15).returncode == 0:
+                    loaded = True
+                    break
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+        state = "loaded" if loaded else "written (load pending next login)"
+        print(f"{accent('Scheduled')} background sync every "
+              f"{interval_s // 60} min — launchd agent {state}")
+        return
+
+    if sys.platform.startswith("linux"):
+        unit_dir = _systemd_unit_dir()
+        try:
+            have_systemd = subprocess.run(
+                ["systemctl", "--user", "is-system-running"],
+                capture_output=True, timeout=10,
+            ).returncode in (0, 1)  # degraded still counts
+        except (OSError, subprocess.TimeoutExpired):
+            have_systemd = False
+        if have_systemd:
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            (unit_dir / "cswap-sync.service").write_text(
+                "[Unit]\nDescription=cswap background sync\n\n"
+                f"[Service]\nType=oneshot\nExecStart={cswap} sync --auto\n"
+            )
+            (unit_dir / "cswap-sync.timer").write_text(
+                "[Unit]\nDescription=cswap background sync timer\n\n"
+                f"[Timer]\nOnUnitActiveSec={interval_s}s\n"
+                f"OnBootSec={interval_s}s\nRandomizedDelaySec=120\n\n"
+                "[Install]\nWantedBy=timers.target\n"
+            )
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                capture_output=True, timeout=15,
+            )
+            proc = subprocess.run(
+                ["systemctl", "--user", "enable", "--now", "cswap-sync.timer"],
+                capture_output=True, timeout=15,
+            )
+            state = "enabled" if proc.returncode == 0 else "written (enable failed)"
+            print(f"{accent('Scheduled')} background sync every "
+                  f"{interval_s // 60} min — systemd user timer {state}")
+            return
+        # cron fallback
+        try:
+            current = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=10
+            ).stdout or ""
+        except (OSError, subprocess.TimeoutExpired):
+            current = ""
+        lines = [ln for ln in current.splitlines() if _CRON_MARK not in ln]
+        minutes = max(1, interval_s // 60)
+        lines.append(f"*/{minutes} * * * * {cswap} sync --auto {_CRON_MARK}")
+        proc = subprocess.run(
+            ["crontab", "-"], input="\n".join(lines) + "\n",
+            text=True, capture_output=True, timeout=10,
+        )
+        state = "installed" if proc.returncode == 0 else "failed"
+        print(f"{accent('Scheduled')} background sync every {minutes} min — "
+              f"crontab entry {state}")
+        return
+
+    print(dimmed("No scheduler support on this platform yet — background "
+                 "sync runs whenever cswap auto / the menubar app is up."))
+
+
+def uninstall_schedule() -> None:
+    removed = []
+    if sys.platform == "darwin":
+        plist = _launchd_plist_path()
+        if plist.exists():
+            for cmd in (
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                ["launchctl", "unload", str(plist)],
+            ):
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=15)
+                    break
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+            plist.unlink()
+            removed.append("launchd agent")
+    elif sys.platform.startswith("linux"):
+        unit_dir = _systemd_unit_dir()
+        if (unit_dir / "cswap-sync.timer").exists():
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "disable", "--now", "cswap-sync.timer"],
+                    capture_output=True, timeout=15,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            for name in ("cswap-sync.timer", "cswap-sync.service"):
+                (unit_dir / name).unlink(missing_ok=True)
+            removed.append("systemd user timer")
+        try:
+            current = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=10
+            ).stdout or ""
+            if _CRON_MARK in current:
+                lines = [ln for ln in current.splitlines() if _CRON_MARK not in ln]
+                subprocess.run(
+                    ["crontab", "-"], input="\n".join(lines) + "\n",
+                    text=True, capture_output=True, timeout=10,
+                )
+                removed.append("crontab entry")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    print(
+        f"{accent('Removed')} {', '.join(removed)}"
+        if removed
+        else dimmed("No schedule was installed.")
+    )
+
+
+def print_sync_status(switcher) -> None:
+    """Local fleet-plumbing view: per-identity credential generation state
+    plus the auto-sync toggle/schedule. Local only on purpose — instant,
+    offline-safe; a fleet view is this command run on each node."""
+    from claude_swap import heal, oauth
+    from claude_swap.settings import load_sync_section_settings
+
+    backup_root = switcher.backup_dir
+    data = switcher._get_sequence_data() or {}
+    accounts = data.get("accounts") or {}
+    try:
+        quarantine = (
+            json.loads(
+                (backup_root / "autoswitch_state.json").read_text(encoding="utf-8")
+            ).get("quarantine") or {}
+        )
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        quarantine = {}
+    heal_state = heal._read_state(backup_root).get("identities") or {}
+    identities = {
+        num: (acc.get("email") or "", acc.get("organizationUuid") or "")
+        for num, acc in accounts.items()
+        if isinstance(acc, dict)
+    }
+    entries = switcher._usage_store.entries(identities) if identities else {}
+
+    if not accounts:
+        print(dimmed("No managed accounts."))
+    for num in sorted(accounts, key=int):
+        email, org = identities[num]
+        if switcher.account_kind_for(num) == "api_key":
+            print(f"  {num}: {email}  api-key (never rotates)")
+            continue
+        creds = switcher.read_account_credentials(num, email) or ""
+        fp = oauth.credential_fingerprint(creds) or ""
+        short_fp = fp.split(":", 1)[-1][:12] if fp else "—"
+        expiry = oauth.credential_expires_at(creds)
+        expiry_s = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(expiry / 1000))
+            if expiry
+            else "unknown"
+        )
+        flags = []
+        entry = entries.get(num)
+        if entry is not None and entry.token_dead():
+            flags.append("DEAD (re-login or heal needed)")
+        if num in quarantine:
+            q = quarantine[num]
+            flags.append(f"quarantined: {q.get('reason')} at {q.get('at')}")
+        h = heal_state.get(f"{email}|{org}")
+        if isinstance(h, dict) and h.get("lastOutcome"):
+            h_at = h.get("lastAttemptAt")
+            h_ago = (
+                f"{int((time.time() - h_at) / 60)}m ago"
+                if isinstance(h_at, (int, float))
+                else "?"
+            )
+            flags.append(f"last heal: {h['lastOutcome']} ({h_ago})")
+        line = f"  {num}: {email}  gen {short_fp}  expires {expiry_s}"
+        if flags:
+            line += "  [" + "; ".join(flags) + "]"
+        print(line)
+
+    config = load_sync_config(backup_root, create=False)
+    settings = load_sync_section_settings(backup_root)
+    stamp_path, _ = _autosync_paths(backup_root)
+    try:
+        last = float(
+            json.loads(stamp_path.read_text(encoding="utf-8")).get("timestamp") or 0
+        )
+        last_s = f"{int((time.time() - last) / 60)}m ago" if last else "never"
+    except (OSError, ValueError, json.JSONDecodeError):
+        last_s = "never"
+    print()
+    print(f"  device {config.device_id[:12] or '(unsynced)'}  "
+          f"peers: {', '.join(config.peers) or 'none'}")
+    print(
+        f"  auto-sync: {'on' if settings.auto_sync else 'off'} "
+        f"(every {settings.auto_sync_interval_minutes}m), last run {last_s}, "
+        f"schedule {'installed' if schedule_installed() else 'not installed'}, "
+        f"heal-on-death {'on' if settings.heal_on_death else 'off'}"
+    )

@@ -550,6 +550,14 @@ def run(switcher) -> int:
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
+            try:
+                from claude_swap import sync as sync_mod
+
+                # Detached: the rumps timer runs on the main thread and must
+                # never wait on SSH.
+                sync_mod.spawn_background_autosync(self.switcher, source="menubar")
+            except Exception:
+                pass
 
         def on_sync_tick(self, _timer):
             if self._dirty:
@@ -631,6 +639,11 @@ def run(switcher) -> int:
                     self.refresh_async()  # reflect the switch promptly
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
+                elif ev.kind == "heal" and getattr(ev, "outcome", "") in (
+                    "healed", "healed-live",
+                ):
+                    rumps.notification("claude-swap", "Credential healed", ev.human())
+                    self.refresh_async()
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
                 elif ev.kind == "config-warning":
@@ -767,6 +780,10 @@ def run(switcher) -> int:
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
+
+            sync_item = rumps.MenuItem("Auto-sync peers", callback=self.on_toggle_autosync)
+            sync_item.state = 1 if self._autosync_enabled() else 0
+            menu.add(sync_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
             current = self._threshold()
@@ -935,6 +952,31 @@ def run(switcher) -> int:
                 self._start_engine()
             else:
                 self._stop_engine()
+            self.rebuild_menu()
+
+        def _autosync_enabled(self) -> bool:
+            try:
+                from claude_swap.settings import load_sync_section_settings
+
+                return load_sync_section_settings(
+                    self.switcher.backup_dir
+                ).auto_sync
+            except Exception:
+                return False
+
+        def on_toggle_autosync(self, _sender):
+            # The core sync.autoSync setting, not a menubar-local one: every
+            # mechanism (schedule, auto loop, TUI) re-reads it at run time,
+            # so this checkbox quiesces or resumes them all.
+            try:
+                set_setting(
+                    self.switcher.backup_dir,
+                    "sync.autoSync",
+                    "false" if self._autosync_enabled() else "true",
+                )
+            except Exception as e:
+                rumps.alert(title="claude-swap", message=f"Couldn't toggle auto-sync: {e}")
+                return
             self.rebuild_menu()
 
         def _make_threshold(self, pct):
