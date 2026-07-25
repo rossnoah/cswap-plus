@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -171,10 +172,15 @@ def push_to_peer(
     )
     os.close(fd)
     try:
-        # export's "Exported N account(s) to <tmp>" line names a temp file
-        # nobody should see; the peer's import summary is the real output.
-        with contextlib.redirect_stdout(io.StringIO()):
+        # export's "Exported N account(s) to <tmp>" line (stderr) names a
+        # temp file nobody should see; the peer's import summary is the real
+        # output. Everything else export says (skip warnings) passes through.
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             export_accounts(switcher, tmp, full=full)
+        for line in (out_buf.getvalue() + err_buf.getvalue()).splitlines():
+            if not line.startswith("Exported "):
+                print(line, file=sys.stderr)
         envelope = Path(tmp).read_bytes()
     finally:
         try:

@@ -1,6 +1,6 @@
 [project]
 name = "cswap-plus"
-version = "0.24.0"
+version = "0.24.1"
 description = "Multi-account switcher for Claude Code — plus device sync, shared usage polling, and a privacy mode"
 readme = "README.md"
 requires-python = ">=3.12"
