@@ -228,7 +228,7 @@ class CswapApp(App):
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
-        shown = mask_email(email) if self.privacy else email
+        shown = mask_email(email, number) if self.privacy else email
         self.push_screen(
             ConfirmModal(
                 f"Remove account {number} ({shown})?\n\n"
@@ -287,7 +287,7 @@ class CswapApp(App):
         occupant = self._slot_occupant(form.slot)
         if occupant is not None:
             if self.privacy:
-                occupant = mask_email(occupant)
+                occupant = mask_email(occupant, form.slot)
             self.push_screen(
                 ConfirmModal(
                     f"Slot {form.slot} is occupied by {occupant}. Overwrite?",

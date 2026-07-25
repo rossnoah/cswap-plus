@@ -171,7 +171,7 @@ def account_card_text(
 ) -> Text:
     """The full account card: header line + per-window bar rows."""
     now = now if now is not None else time.time()
-    email = mask_email(acc.email) if privacy else acc.email
+    email = mask_email(acc.email, acc.number) if privacy else acc.email
     tag = mask_org(acc.display_tag) if privacy else acc.display_tag
 
     text = Text()
@@ -253,7 +253,7 @@ def mini_account_text(
     maxed per-model window shows as ``Fable (!)``. Sentinel states show
     their label instead.
     """
-    email = mask_email(acc.email) if privacy else acc.email
+    email = mask_email(acc.email, acc.number) if privacy else acc.email
     tag = mask_org(acc.display_tag) if privacy else acc.display_tag
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")

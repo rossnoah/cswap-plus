@@ -2,8 +2,8 @@
 
 Privacy mode hides account identities (emails, org names) from rendered
 output — for screen shares and screenshots — while keeping accounts
-distinguishable by slot number, alias, and the first character of each
-masked part.
+distinguishable by slot number: wherever the slot is known the identity
+renders as ``Account N``; free text falls back to first-character masks.
 """
 
 from __future__ import annotations
@@ -17,8 +17,14 @@ MASK = "•••"
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
-def mask_email(email: str) -> str:
-    """``noahwross@gmail.com`` → ``n•••@g•••`` (first char of each part)."""
+def mask_email(email: str, number: str | int | None = None) -> str:
+    """``noahwross@gmail.com`` → ``Account 2`` when the slot is known.
+
+    Without a slot (free text, unknown identities) fall back to the
+    first-char mask: ``n•••@g•••``.
+    """
+    if number is not None:
+        return f"Account {number}"
     if not email:
         return email
     local, sep, domain = email.partition("@")

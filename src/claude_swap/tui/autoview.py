@@ -309,7 +309,7 @@ class AutoScreen(Screen):
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            email = mask_email(acc.email) if self.app.privacy else acc.email
+            email = mask_email(acc.email, acc.number) if self.app.privacy else acc.email
             entry.append(email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(

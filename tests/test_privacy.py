@@ -66,3 +66,12 @@ class TestPrivacySetting:
         ui = load_ui_settings(tmp_path)
         assert ui.theme == "light"
         assert ui.privacy is False
+
+
+class TestSlotAwareMask:
+    def test_known_slot_renders_account_n(self):
+        assert mask_email("noahwross@gmail.com", 2) == "Account 2"
+        assert mask_email("noahwross@gmail.com", "5") == "Account 5"
+
+    def test_no_slot_keeps_char_mask(self):
+        assert mask_email("noahwross@gmail.com") == "n•••@g•••"

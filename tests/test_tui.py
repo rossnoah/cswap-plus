@@ -1506,7 +1506,7 @@ class TestPrivacy:
             plain = panel.render().plain
             assert "user1@example.com" not in plain
             assert "user2@example.com" not in plain
-            assert "u•••@e•••" in plain
+            assert "Account 1" in plain and "Account 2" in plain
             saved = json.loads((tmp_path / "settings.json").read_text())
             assert saved["ui"]["privacy"] is True
 
@@ -1573,7 +1573,7 @@ class TestPrivacy:
             ]
             joined = "\n".join(labels)
             assert "user1@example.com" not in joined
-            assert "u•••@e•••" in joined
+            assert "Account 1" in joined
 
     async def test_switch_screen_cards_masked(self, tmp_path):
         from claude_swap.tui.widgets import AccountCard

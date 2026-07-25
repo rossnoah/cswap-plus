@@ -95,7 +95,7 @@ class DashboardScreen(Screen):
 
     def _display_parts(self, acc) -> tuple[str, str]:
         """(name, tag) for a menu row, honouring privacy mode."""
-        email = mask_email(acc.email) if self.app.privacy else acc.email
+        email = mask_email(acc.email, acc.number) if self.app.privacy else acc.email
         tag = mask_org(acc.display_tag) if self.app.privacy else acc.display_tag
         name = f"{acc.alias} ({email})" if acc.alias else email
         return name, tag
