@@ -16,6 +16,27 @@ A fork of [claude-swap](https://github.com/realiti4/claude-swap) that adds:
   deterministic phase stagger; `cswap sync` also trades fresh usage
   measurements between peers so no device re-fetches what another just
   paid for.
+- **Active-account sync** — switching on one device moves the fleet: the
+  switch pushes to reachable peers immediately and `cswap sync` carries
+  it to the rest (last-writer-wins, echo-proof). Manual switches always
+  broadcast; `sync.broadcastAutoSwitches` opts the auto engine in,
+  `sync.followRemoteSwitches` controls the receiving side, and
+  `cswap switch <acct> --no-broadcast` keeps one switch local.
+- **Credential auto-heal** — OAuth refresh tokens rotate server-side, so
+  a copy on another device is a countdown to `invalid_grant` ("keeps
+  logging me out"). Sync now replaces stale copies with the newer
+  generation (`freshened`), repairs the *live* login in place, and the
+  moment any device sees `invalid_grant` it pulls a working generation
+  from whichever peer has one (`cswap sync heal`, automatic via
+  `sync.healOnDeath`). `cswap sync status` shows per-account generation
+  and heal state.
+- **Background auto-sync** — all of the above without typing anything:
+  a running `cswap auto`/menubar/TUI piggybacks a quiet sync every
+  `sync.autoSyncIntervalMinutes` (default 15), and
+  `cswap sync install-schedule` adds a launchd/systemd floor for when
+  nothing is running. One master toggle: `cswap sync auto on|off` (or
+  the menubar's *Auto-sync peers* checkbox) — checked at run time by
+  every mechanism, so **off** means quiesced everywhere, instantly.
 
 Everything below is inherited from upstream and works unchanged.
 
