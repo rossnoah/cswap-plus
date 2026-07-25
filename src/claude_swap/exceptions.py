@@ -72,6 +72,12 @@ class ValidationError(ClaudeSwitchError):
     pass
 
 
+class SyncError(ClaudeSwitchError):
+    """Raised when syncing accounts with an SSH peer fails."""
+
+    pass
+
+
 class TransferError(ClaudeSwitchError):
     """Error during account export or import."""
 

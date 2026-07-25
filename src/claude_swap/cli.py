@@ -432,6 +432,125 @@ Examples:
         sys.exit(130)
 
 
+def _sync_command(argv: list[str]) -> None:
+    """Handle `cswap sync [HOST...]` and the peer-list verbs.
+
+    Pre-dispatched before the main parser for the same reason as `alias`
+    (the main parser's required mutually-exclusive group can't hold a
+    positional subcommand).
+    """
+    from claude_swap import sync as sync_mod
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} sync",
+        description=(
+            "Sync accounts with other devices over SSH. With no arguments, "
+            "pulls from and pushes to every saved peer; name hosts to sync "
+            "just those. The remote side runs cswap export/import, so "
+            "conflicts follow import's rules: dead tokens are healed, "
+            "healthy accounts are kept unless --force."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap sync add mm            save a peer (an ssh alias, host, or user@host)
+  cswap sync                   sync every saved peer (pull, then push)
+  cswap sync ubuntu            sync one host (need not be saved)
+  cswap sync --pull            only import from peers
+  cswap sync --push --force    overwrite peers' accounts with ours
+        """,
+    )
+    parser.add_argument(
+        "hosts",
+        metavar="HOST",
+        nargs="*",
+        help="SSH destinations to sync (default: saved peers). "
+        "Also: add/remove HOST to edit the peer list, list to show it",
+    )
+    direction = parser.add_mutually_exclusive_group()
+    direction.add_argument(
+        "--pull", action="store_true", help="Only import accounts from peers"
+    )
+    direction.add_argument(
+        "--push", action="store_true", help="Only send accounts to peers"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing healthy accounts on the receiving side",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Push full credential/config payloads instead of the slim form",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+
+        verb = args.hosts[0] if args.hosts else None
+        if verb in ("add", "remove", "list"):
+            if args.pull or args.push or args.force or args.full:
+                error(f"Error: 'sync {verb}' takes no sync options")
+                sys.exit(1)
+            if verb == "list":
+                config = sync_mod.load_sync_config(root)
+                if not config.peers:
+                    print(dimmed("No sync peers. Add one: cswap sync add <host>"))
+                for host in config.peers:
+                    print(f"  {host}")
+                return
+            if len(args.hosts) != 2:
+                error(f"Error: usage: {_prog_name()} sync {verb} <host>")
+                sys.exit(1)
+            host = args.hosts[1]
+            if verb == "add":
+                added = sync_mod.add_peer(root, host)
+                print(
+                    f"{accent('Added')} sync peer {host}"
+                    if added
+                    else f"{dimmed('Already a peer:')} {host}"
+                )
+            else:
+                removed = sync_mod.remove_peer(root, host)
+                print(
+                    f"{accent('Removed')} sync peer {host}"
+                    if removed
+                    else f"{dimmed('Not a peer:')} {host}"
+                )
+            return
+
+        hosts = [sync_mod.validate_host(h) for h in args.hosts]
+        if not hosts:
+            hosts = list(sync_mod.load_sync_config(root).peers)
+        if not hosts:
+            error(
+                "Error: no sync peers configured. "
+                f"Add one: {_prog_name()} sync add <host>"
+            )
+            sys.exit(1)
+        failures = sync_mod.sync_peers(
+            switcher,
+            hosts,
+            pull=not args.push,
+            push=not args.pull,
+            force=args.force,
+            full=args.full,
+        )
+        if failures:
+            sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _alias_command(argv: list[str]) -> None:
     """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
 
@@ -890,6 +1009,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "sync":
+        _sync_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -932,6 +1054,8 @@ Commands:
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
+  %(prog)s sync [host...]             sync accounts with SSH peers
+  %(prog)s sync add <host>            save a sync peer
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
