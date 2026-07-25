@@ -468,8 +468,31 @@ def import_accounts(
         )
 
         if existing_slot is not None:
+            incoming_fp = oauth_mod.credential_fingerprint(entry["creds_text"])
+            stored_fp = oauth_mod.credential_fingerprint(
+                switcher._read_account_credentials(existing_slot, entry["email"])
+                or ""
+            )
             if force:
                 outcome = "overwrote"
+            elif (
+                switcher._usage_store.entries(
+                    {existing_slot: (entry["email"], entry["org_uuid"])}
+                )[existing_slot].token_dead()
+                and incoming_fp is not None
+                and incoming_fp == stored_fp
+            ):
+                # Replacing a dead copy with the identical dead generation
+                # would clear the strike, trigger a doomed refetch, and
+                # re-strike — churn with no repair. Skipping instead is what
+                # makes an all-dead fleet converge rather than ping-pong.
+                _eprint(
+                    f"Skipped {entry['email']} (same dead generation)"
+                )
+                skipped += 1
+                if is_envelope_active:
+                    resolved_active_slot = existing_slot
+                continue
             elif (
                 switcher._usage_store.entries(
                     {existing_slot: (entry["email"], entry["org_uuid"])}

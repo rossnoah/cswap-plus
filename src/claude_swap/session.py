@@ -53,7 +53,7 @@ from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
+from claude_swap.oauth import try_refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
@@ -510,11 +510,31 @@ class SessionManager:
         # Setup-token accounts (--add-token) have no refresh token by design —
         # skip silently instead of warning about a flow that can't happen.
         if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
+            outcome = try_refresh_oauth_credentials(creds)
+            if outcome.credentials:
+                creds = outcome.credentials
                 self.switcher.write_account_credentials(account_num, email, creds)
             else:
+                if outcome.error == "invalid_grant":
+                    # The lineage is dead — classification used to be thrown
+                    # away here. Ledger it and hand off to a detached fleet
+                    # heal; bootstrap itself stays non-blocking and proceeds
+                    # (claude will fail auth and say so if nothing helps).
+                    try:
+                        from claude_swap import heal
+                        from claude_swap.oauth import credential_fingerprint
+
+                        data = self.switcher._get_sequence_data() or {}
+                        acc = (data.get("accounts") or {}).get(account_num) or {}
+                        heal.note_dead_fingerprint(
+                            self.switcher.backup_dir,
+                            email,
+                            acc.get("organizationUuid") or "",
+                            credential_fingerprint(creds),
+                        )
+                        heal.spawn_background_heal(self.switcher)
+                    except Exception:
+                        pass
                 warning(
                     f"Could not refresh the token for Account-{account_num}; "
                     "continuing with the stored credentials."

@@ -273,6 +273,37 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class HealEvent(AutoSwitchEvent):
+    """A fleet heal attempt for a dead credential (see ``heal.py``)."""
+
+    kind: ClassVar[str] = "heal"
+    number: str
+    email: str
+    outcome: str  # HealOutcome.status
+    host: str = ""
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "email": self.email,
+            "outcome": self.outcome,
+            "host": self.host,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        if self.outcome in ("healed", "healed-live"):
+            live = " and re-activated" if self.outcome == "healed-live" else ""
+            return (
+                f"Account-{self.number} ({self.email}) healed from "
+                f"{self.host}{live}"
+            )
+        line = f"heal for Account-{self.number} ({self.email}): {self.outcome}"
+        return line + (f" ({self.detail})" if self.detail else "")
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -507,6 +538,29 @@ class AutoSwitchEngine:
 
         self._mutate_state(add)
         self._emit(QuarantineEvent(number=number, email=email, reason=reason))
+
+    def _maybe_heal(self, number: str, email: str) -> None:
+        """Fleet heal for a slot that just proved invalid_grant. Best-effort:
+        every failure mode is an event/log line, never a tick failure."""
+        try:
+            from claude_swap import heal
+
+            data = self.switcher._get_sequence_data() or {}
+            acc = (data.get("accounts") or {}).get(number) or {}
+            org_uuid = acc.get("organizationUuid") or ""
+
+            def emit(outcome: "heal.HealOutcome") -> None:
+                self._emit(HealEvent(
+                    number=number,
+                    email=email,
+                    outcome=outcome.status,
+                    host=outcome.host or "",
+                    detail=outcome.detail,
+                ))
+
+            heal.heal_from_peers(self.switcher, email, org_uuid, emit=emit)
+        except Exception as e:
+            _logger.info("engine heal skipped for %s: %s", email, e)
 
     def _release_recovered_quarantines(self, state: dict) -> dict:
         """Drop quarantine entries whose credential was replaced since.
@@ -1026,6 +1080,11 @@ class AutoSwitchEngine:
                 continue
             if status == "invalid_grant":
                 self._quarantine(num, email, "invalid_grant")
+                # Inline fleet heal: the engine thread is long-running and
+                # non-interactive, so a bounded SSH round-trip per peer is
+                # acceptable here. A healed slot re-enters rotation next tick
+                # when the quarantine releases on the fingerprint change.
+                self._maybe_heal(num, email)
                 continue
             if status == "transient":
                 transient_failure = True
@@ -1430,6 +1489,17 @@ class AutoSwitchEngine:
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            # Piggyback: a running engine keeps background sync alive without
+            # any OS schedule. Detached spawn — the due-check is two file
+            # reads, and the sync itself never delays the next tick.
+            try:
+                from claude_swap import sync as sync_mod
+
+                sync_mod.spawn_background_autosync(
+                    self.switcher, source="auto-loop"
+                )
+            except Exception:
+                pass
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)

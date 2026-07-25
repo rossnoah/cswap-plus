@@ -1601,6 +1601,11 @@ class TestImportClearsDeadTokenQuarantine:
 
         out = temp_home / "bob.cswap"
         export_accounts(s, str(out), account="2")
+        # Re-importing the identical bytes would (correctly) skip as the same
+        # dead generation; the heal-replace under test needs a different one.
+        envelope = json.loads(out.read_text())
+        envelope["accounts"][0]["credentials"]["refreshToken"] = "rtok-other"
+        out.write_text(json.dumps(envelope))
 
         session_dir = session_dir_for(s.backup_dir, "2", "bob@example.com")
         pid_dir = session_dir / "sessions"

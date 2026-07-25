@@ -146,11 +146,13 @@ def auth_status_tracks_seed(monkeypatch):
 def refresh_rotates(monkeypatch):
     calls: list[str] = []
 
-    def fake_refresh(creds: str) -> str:
-        calls.append(creds)
-        return ROTATED_CREDS
+    def fake_refresh(creds: str):
+        from claude_swap.oauth import RefreshOutcome
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+        calls.append(creds)
+        return RefreshOutcome(ROTATED_CREDS, None)
+
+    monkeypatch.setattr(session_mod, "try_refresh_oauth_credentials", fake_refresh)
     return calls
 
 
@@ -347,7 +349,13 @@ class TestBootstrap:
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        from claude_swap.oauth import RefreshOutcome
+
+        monkeypatch.setattr(
+            session_mod,
+            "try_refresh_oauth_credentials",
+            lambda c: RefreshOutcome(None, "transient"),
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
@@ -361,10 +369,12 @@ class TestBootstrap:
         )
         seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
         refresh_calls = []
+        from claude_swap.oauth import RefreshOutcome
+
         monkeypatch.setattr(
             session_mod,
-            "refresh_oauth_credentials",
-            lambda c: refresh_calls.append(c) or None,
+            "try_refresh_oauth_credentials",
+            lambda c: refresh_calls.append(c) or RefreshOutcome(None, "transient"),
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)

@@ -2887,6 +2887,23 @@ class ClaudeAccountSwitcher:
             for num in to_fetch:
                 if entries[num].token_dead():
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
+            # Newly-dead this pass: hand off to the fleet heal. Detached
+            # subprocess only — this path runs inside --list/--status and the
+            # TUI's poll, so it must never wait on SSH.
+            newly_dead = [
+                num for num in to_fetch
+                if entries[num].token_dead() and not pre[num].token_dead()
+            ]
+            if newly_dead:
+                try:
+                    from claude_swap import heal
+
+                    heal.on_death_detected(
+                        self,
+                        [(num, *identities[num]) for num in newly_dead],
+                    )
+                except Exception as e:
+                    self._logger.info(f"heal hand-off skipped: {e}")
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
