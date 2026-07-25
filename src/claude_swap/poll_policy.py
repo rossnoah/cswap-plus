@@ -32,6 +32,7 @@ module only.
 
 from __future__ import annotations
 
+import hashlib
 import random
 from collections.abc import Callable
 from datetime import datetime
@@ -151,6 +152,18 @@ def parse_reset_ts(resets_at: str | None) -> float | None:
         return None
 
 
+def poll_phase(device_id: str, identity: tuple[str, str]) -> float:
+    """Stable jitter draw in [0, 1) for one device × account pair.
+
+    Hash-derived so a fleet of devices lands spread across each account's
+    poll interval without coordinating; an empty device id (sync never
+    configured) still yields a usable constant."""
+    digest = hashlib.sha256(
+        f"{device_id}:{identity[0]}:{identity[1]}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
 def plan_after_fetch(
     *,
     prev_interval_s: float | None,
@@ -162,6 +175,8 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    share_factor: float = 1.0,
+    phase: float | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
@@ -175,6 +190,14 @@ def plan_after_fetch(
     ``JITTER_FRAC`` noise, is never later than the account's next window
     reset (+ ``RESET_SLACK_S``), and an at-limit account skips straight to
     the reset that frees it (the learned interval is kept for its return).
+
+    ``share_factor`` > 1 declares this token's API budget shared by that many
+    devices (``poll.budgetShare``): the final interval is multiplied so the
+    fleet's combined rate matches one device's, proactively — the post-429
+    AIMD stays as the reactive safety net. ``phase`` (0..1, stable per
+    device × account) replaces the random jitter draw so contending devices
+    spread deterministically across the interval instead of coinciding by
+    luck; single-device planning keeps the random draw.
     """
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
@@ -208,8 +231,14 @@ def plan_after_fetch(
         # budget. Floored at POST_429_MIN_INTERVAL_S for the first 429.
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
         interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
+    if share_factor > 1.0:
+        # Applied last, past the per-device ceilings on purpose: those cap one
+        # device's cadence, and the fleet's combined rate is what must fit the
+        # budget. The reset clamp below still bounds the wait.
+        interval *= share_factor
 
-    next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
+    jitter_draw = phase if phase is not None else rng()
+    next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * jitter_draw - 1.0))
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:
         reset_ts = limiting_reset_ts(new_usage, models)

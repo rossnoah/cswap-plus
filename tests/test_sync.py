@@ -127,7 +127,8 @@ class TestSyncPeers:
             calls.append(("push", host))
 
         with patch.object(sync, "pull_from_peer", side_effect=fake_pull), \
-             patch.object(sync, "push_to_peer", side_effect=fake_push):
+             patch.object(sync, "push_to_peer", side_effect=fake_push), \
+             patch.object(sync, "gossip_usage"):
             failures = sync.sync_peers(switcher, ["bad", "good"])
         assert failures == 1
         assert calls == [("pull", "good"), ("push", "good")]
@@ -136,7 +137,8 @@ class TestSyncPeers:
     def test_direction_flags(self, tmp_path):
         switcher = FakeSwitcher(tmp_path)
         with patch.object(sync, "pull_from_peer") as pull, \
-             patch.object(sync, "push_to_peer") as push:
+             patch.object(sync, "push_to_peer") as push, \
+             patch.object(sync, "gossip_usage"):
             sync.sync_peers(switcher, ["mm"], push=False)
             assert pull.called and not push.called
             pull.reset_mock()

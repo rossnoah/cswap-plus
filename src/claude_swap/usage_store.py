@@ -617,6 +617,70 @@ class UsageStore:
 
         self._mutate(identities, plans.keys(), apply)
 
+    def export_rows(self) -> dict[str, dict]:
+        """Identity-keyed measurement snapshot for cross-device gossip.
+
+        Slot numbers are per-device, so rows travel keyed by
+        ``"email|organizationUuid"``. Only successful measurements travel —
+        ``lastGood``/``fetchedAt`` plus the 429 stamp (the receiving planner
+        should know the token is contended); plans, backoff, and dead-token
+        strikes are this device's business. Duplicate identities across
+        slots keep the freshest measurement."""
+        out: dict[str, dict] = {}
+        for row in self._read_rows().values():
+            if not isinstance(row, dict):
+                continue
+            email = row.get("email")
+            fetched_at = _num_or_none(row.get("fetchedAt"))
+            if not email or fetched_at is None or row.get("lastGood") is None:
+                continue
+            key = f"{email}|{row.get('organizationUuid') or ''}"
+            if key in out and out[key]["fetchedAt"] >= fetched_at:
+                continue
+            out[key] = {
+                "fetchedAt": fetched_at,
+                "lastGood": row["lastGood"],
+                "last429At": _num_or_none(row.get("last429At")),
+            }
+        return out
+
+    def merge_remote_rows(
+        self, remote: dict[str, dict], identities: dict[str, Identity]
+    ) -> int:
+        """Adopt a peer's fresher measurements for accounts we also manage.
+
+        Only ``lastGood``/``fetchedAt`` (and a newer ``last429At``) are
+        taken, and only when strictly fresher than ours — poll plans,
+        backoff, and quarantine state stay local, and identities without a
+        local slot are ignored. Returns the number of slots updated."""
+        if not isinstance(remote, dict) or not identities:
+            return 0
+        merged = 0
+
+        def apply(num: str, row: dict) -> None:
+            nonlocal merged
+            email, org_uuid = identities[num]
+            incoming = remote.get(f"{email}|{org_uuid or ''}")
+            if not isinstance(incoming, dict):
+                return
+            fetched_at = _num_or_none(incoming.get("fetchedAt"))
+            last_good = incoming.get("lastGood")
+            if fetched_at is None or not isinstance(last_good, dict):
+                return
+            their_429 = _num_or_none(incoming.get("last429At"))
+            ours_429 = _num_or_none(row.get("last429At"))
+            if their_429 is not None and (ours_429 is None or their_429 > ours_429):
+                row["last429At"] = their_429
+            ours = _num_or_none(row.get("fetchedAt"))
+            if ours is not None and ours >= fetched_at:
+                return
+            row["lastGood"] = last_good
+            row["fetchedAt"] = fetched_at
+            merged += 1
+
+        self._mutate(identities, list(identities), apply)
+        return merged
+
     def clear_dead_token(
         self, nums: Iterable[str], identities: dict[str, Identity]
     ) -> None:

@@ -493,6 +493,20 @@ Examples:
         root = switcher.backup_dir
 
         verb = args.hosts[0] if args.hosts else None
+        # Internal gossip verbs, invoked over SSH by a syncing peer: dump our
+        # usage measurements / merge theirs from stdin. Machine-facing output.
+        if verb == "emit-usage":
+            print(sync_mod.emit_usage(switcher))
+            return
+        if verb == "absorb-usage":
+            try:
+                payload = json.loads(sys.stdin.read())
+            except json.JSONDecodeError as exc:
+                error(f"Error: invalid gossip payload: {exc}")
+                sys.exit(1)
+            merged = sync_mod.absorb_usage(switcher, payload)
+            print(f"usage: adopted {merged} fresher measurement(s)")
+            return
         if verb in ("add", "remove", "list"):
             if args.pull or args.push or args.force or args.full:
                 error(f"Error: 'sync {verb}' takes no sync options")

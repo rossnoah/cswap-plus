@@ -14,6 +14,7 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
+    PollSettings,
     UiSettings,
     effective_settings,
     load_settings,
@@ -162,9 +163,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["poll"] == {
+            f.name for f in PollSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "poll": PollSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

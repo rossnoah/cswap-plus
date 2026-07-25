@@ -53,8 +53,13 @@ def sync_config_path(backup_root: Path) -> Path:
     return backup_root / SYNC_FILENAME
 
 
-def load_sync_config(backup_root: Path) -> SyncConfig:
-    """Read sync.json, minting (and persisting) a device id on first use."""
+def load_sync_config(backup_root: Path, *, create: bool = True) -> SyncConfig:
+    """Read sync.json, minting (and persisting) a device id on first use.
+
+    ``create=False`` is the read-only form for surfaces that only consult the
+    config (poll-budget sharing): no sync.json appears in the backup roots of
+    users who never touch ``cswap sync``; the device id is ``""`` until then.
+    """
     path = sync_config_path(backup_root)
     raw: dict = {}
     try:
@@ -68,6 +73,8 @@ def load_sync_config(backup_root: Path) -> SyncConfig:
         p for p in raw.get("peers", []) if isinstance(p, str) and _HOST_RE.match(p)
     )
     if not isinstance(device_id, str) or not device_id:
+        if not create:
+            return SyncConfig(device_id="", peers=peers)
         device_id = uuid.uuid4().hex
         _save(backup_root, SyncConfig(device_id=device_id, peers=peers))
     return SyncConfig(device_id=device_id, peers=peers)
@@ -182,6 +189,65 @@ def push_to_peer(
         print(f"  {dimmed(line)}")
 
 
+GOSSIP_SCHEMA_VERSION = 1
+
+
+def _identities(switcher) -> dict[str, tuple[str, str]]:
+    """Slot → (email, organizationUuid) for every managed account."""
+    data = switcher._get_sequence_data() or {}
+    return {
+        num: (acc.get("email") or "", acc.get("organizationUuid") or "")
+        for num, acc in (data.get("accounts") or {}).items()
+        if isinstance(acc, dict)
+    }
+
+
+def emit_usage(switcher) -> str:
+    """The usage-gossip payload: this device's freshest measurements."""
+    return json.dumps(
+        {
+            "schemaVersion": GOSSIP_SCHEMA_VERSION,
+            "usage": switcher._usage_store.export_rows(),
+        }
+    )
+
+
+def absorb_usage(switcher, payload: object) -> int:
+    """Merge a peer's gossip payload; returns adopted-measurement count."""
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schemaVersion") != GOSSIP_SCHEMA_VERSION
+        or not isinstance(payload.get("usage"), dict)
+    ):
+        raise SyncError("unrecognized usage-gossip payload")
+    return switcher._usage_store.merge_remote_rows(
+        payload["usage"], _identities(switcher)
+    )
+
+
+def gossip_usage(switcher, host: str, *, pull: bool, push: bool) -> None:
+    """Trade usage measurements with a peer so neither re-polls what the
+    other just fetched. Best-effort by design: a peer running plain
+    claude-swap has no gossip verbs, and account sync must not fail on it."""
+    try:
+        if pull:
+            proc = _run_remote(host, "sync emit-usage")
+            if proc.returncode != 0:
+                print(dimmed(f"  {host}: no usage gossip (older cswap?)"))
+                return
+            merged = absorb_usage(switcher, json.loads(proc.stdout.decode()))
+            if merged:
+                print(dimmed(f"  usage: adopted {merged} fresher measurement(s)"))
+        if push:
+            proc = _run_remote(
+                host, "sync absorb-usage -", emit_usage(switcher).encode()
+            )
+            if proc.returncode != 0:
+                print(dimmed(f"  {host}: no usage gossip (older cswap?)"))
+    except (SyncError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        warning(f"  usage gossip with {host} skipped: {exc}")
+
+
 def sync_peers(
     switcher,
     hosts: list[str],
@@ -203,6 +269,7 @@ def sync_peers(
                 pull_from_peer(switcher, host, force=force)
             if push:
                 push_to_peer(switcher, host, force=force, full=full)
+            gossip_usage(switcher, host, pull=pull, push=push)
         except SyncError as exc:
             warning(f"  {exc}")
             failures += 1

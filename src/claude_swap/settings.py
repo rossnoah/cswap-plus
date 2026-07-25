@@ -68,7 +68,25 @@ class UiSettings:
     privacy: bool = False
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class PollSettings:
+    """Usage-poll budget sharing (``poll`` section).
+
+    The usage API allows a rolling budget per access token, shared by every
+    device polling that account. ``budget_share`` is the number of devices
+    sharing it: each device multiplies its poll intervals by this factor
+    (with a deterministic per-device phase stagger) so the fleet's combined
+    request rate stays inside one device's budget. 0 = auto: 1 + the number
+    of saved ``cswap sync`` peers."""
+
+    budget_share: int = 0
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "poll": PollSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -143,6 +161,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "privacy", "privacy", "bool",
             help="Hide emails and org names in the TUI (toggle with p)",
+        ),
+        SettingSpec(
+            "poll", "budgetShare", "budget_share", "int", 0, 16,
+            help="Devices sharing each account's usage-API budget "
+            "(0 = auto: 1 + sync peers); poll intervals multiply by this",
         ),
     )
 }
@@ -258,6 +281,26 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         privacy = default.privacy
     return UiSettings(theme=theme, privacy=privacy)
+
+
+def load_poll_settings(backup_root: Path) -> PollSettings:
+    """Load the poll section; missing/corrupt file or mistyped value → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("poll")
+    default = PollSettings()
+    if not isinstance(section, dict):
+        return default
+    share = section.get("budgetShare", default.budget_share)
+    spec = SETTING_SPECS["poll.budgetShare"]
+    if not isinstance(share, int) or isinstance(share, bool) or not (
+        spec.lo <= share <= spec.hi
+    ):
+        _logger.warning(
+            "settings.json: invalid poll.budgetShare %r; using %r",
+            share, default.budget_share,
+        )
+        return default
+    return PollSettings(budget_share=share)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -424,6 +467,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "poll": load_poll_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

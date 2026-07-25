@@ -275,6 +275,8 @@ class ClaudeAccountSwitcher:
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (budget share, device id) — see _poll_share_inputs.
+        self._poll_share_cache: tuple[int, str] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2902,6 +2904,7 @@ class ClaudeAccountSwitcher:
         and keep their (now past-due) plan for when the backoff lifts."""
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
+        share, device_id = self._poll_share_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -2919,9 +2922,34 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                share_factor=float(share),
+                phase=poll_policy.poll_phase(device_id, identities[num])
+                if share > 1
+                else None,
             )
         if plans:
             self._usage_store.set_poll_plan(plans, identities)
+
+    def _poll_share_inputs(self) -> tuple[int, str]:
+        """(devices sharing the usage-API budget, this device's id), cached.
+
+        poll.budgetShare of 0 (the default) derives the count from the saved
+        sync peer list; no sync.json means a fleet of one, and the read never
+        creates the file. Loaded once per switcher, like the poll-policy
+        threshold — a settings change lands on the next process."""
+        if self._poll_share_cache is None:
+            try:
+                from claude_swap.settings import load_poll_settings
+                from claude_swap.sync import load_sync_config
+
+                config = load_sync_config(self.backup_dir, create=False)
+                share = load_poll_settings(self.backup_dir).budget_share
+                if share == 0:
+                    share = 1 + len(config.peers)
+                self._poll_share_cache = (max(1, share), config.device_id)
+            except Exception:
+                self._poll_share_cache = (1, "")
+        return self._poll_share_cache
 
     def _replan_new_active(self, number: str, email: str, org_uuid: str) -> None:
         """Pull the just-activated account's poll plan to the active floor.
