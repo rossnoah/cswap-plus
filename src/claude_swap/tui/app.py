@@ -17,6 +17,7 @@ from textual.worker import WorkerState
 
 from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
+from claude_swap.privacy import mask_email, mask_text
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
@@ -34,12 +35,16 @@ class CswapApp(App):
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_theme", "Theme"),
+        Binding("p", "toggle_privacy", "Privacy"),
+    ]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
 
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
     busy: reactive[bool] = reactive(False)
+    privacy: reactive[bool] = reactive(False)
 
     def __init__(
         self,
@@ -66,7 +71,9 @@ class CswapApp(App):
         except Exception:
             self.threshold_pct = None
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            ui = load_ui_settings(switcher.backup_dir)
+            self._theme_name = ui.theme
+            self.privacy = ui.privacy
         except Exception:
             self._theme_name = "auto"
 
@@ -164,22 +171,24 @@ class CswapApp(App):
         self.busy = False
         self.request_refresh()
         if not result.ok:
-            self.push_screen(OutputModal(f"{label} — failed", result.output))
+            self.push_screen(
+                OutputModal(f"{label} — failed", self._masked(result.output))
+            )
             return
         payload = result.payload or {}
         if "switched" in payload:
             if payload.get("switched"):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                self.notify(f"Switched to {self._masked(target)}", title="Switch")
             else:
                 reason = str(payload.get("reason") or "no switch performed")
-                self.notify(reason, title="No switch", severity="warning")
+                self.notify(self._masked(reason), title="No switch", severity="warning")
             return
         if show_output and result.output.strip():
-            self.push_screen(OutputModal(label, result.output))
+            self.push_screen(OutputModal(label, self._masked(result.output)))
         elif result.first_line:
-            self.notify(result.first_line)
+            self.notify(self._masked(result.first_line))
 
     # -- account operations ----------------------------------------------------
 
@@ -212,9 +221,10 @@ class CswapApp(App):
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
+        shown = mask_email(email) if self.privacy else email
         self.push_screen(
             ConfirmModal(
-                f"Remove account {number} ({email})?\n\n"
+                f"Remove account {number} ({shown})?\n\n"
                 "Its stored credentials and config backup are deleted.",
                 title="Remove account",
                 yes_label="Remove",
@@ -269,6 +279,8 @@ class CswapApp(App):
         )
         occupant = self._slot_occupant(form.slot)
         if occupant is not None:
+            if self.privacy:
+                occupant = mask_email(occupant)
             self.push_screen(
                 ConfirmModal(
                     f"Slot {form.slot} is occupied by {occupant}. Overwrite?",
@@ -331,3 +343,16 @@ class CswapApp(App):
         nxt = order[(order.index(self._theme_name) + 1) % len(order)]
         self.apply_theme(nxt)
         self.notify(f"Theme: {nxt}")
+
+    # -- privacy ------------------------------------------------------------
+
+    def _masked(self, text: str) -> str:
+        return mask_text(text) if self.privacy else text
+
+    def action_toggle_privacy(self) -> None:
+        self.privacy = not self.privacy
+        try:
+            set_setting(self.switcher.backup_dir, "ui.privacy", str(self.privacy))
+        except Exception as exc:  # persistence is best-effort; never crash the UI
+            self.notify(f"Could not save privacy setting: {exc}", severity="warning")
+        self.notify(f"Privacy: {'on' if self.privacy else 'off'}")

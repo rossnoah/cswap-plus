@@ -61,9 +61,11 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    color theme; ``auto`` follows terminal-background detection. ``privacy``
+    masks emails and org names in the TUI (toggled live with ``p``)."""
 
     theme: str = "auto"
+    privacy: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
@@ -137,6 +139,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "ui", "privacy", "privacy", "bool",
+            help="Hide emails and org names in the TUI (toggle with p)",
         ),
     )
 }
@@ -243,8 +249,15 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             "settings.json: unsupported ui.theme %r; using %r",
             theme, default.theme,
         )
-        return default
-    return UiSettings(theme=theme)
+        theme = default.theme
+    privacy = section.get("privacy", default.privacy)
+    if not isinstance(privacy, bool):
+        _logger.warning(
+            "settings.json: ui.privacy %r is not a bool; using %r",
+            privacy, default.privacy,
+        )
+        privacy = default.privacy
+    return UiSettings(theme=theme, privacy=privacy)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

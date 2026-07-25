@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.models import AccountsSnapshot
+from claude_swap.privacy import mask_email
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
@@ -111,6 +112,7 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
+        self.watch(self.app, "privacy", lambda _p: self._on_snapshot(self.app.snapshot))
         self._start_engine(dry_run=True)
 
     def on_unmount(self) -> None:
@@ -307,7 +309,8 @@ class AutoScreen(Screen):
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            email = mask_email(acc.email) if self.app.privacy else acc.email
+            entry.append(email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted

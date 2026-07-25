@@ -26,6 +26,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
+from claude_swap.privacy import mask_email, mask_org
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -81,6 +82,7 @@ class DashboardScreen(Screen):
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
+            ("Toggle privacy (p)", "privacy"),
             ("Quit", "quit"),
         ]
 
@@ -91,16 +93,21 @@ class DashboardScreen(Screen):
             _BACK,
         ]
 
+    def _display_parts(self, acc) -> tuple[str, str]:
+        """(name, tag) for a menu row, honouring privacy mode."""
+        email = mask_email(acc.email) if self.app.privacy else acc.email
+        tag = mask_org(acc.display_tag) if self.app.privacy else acc.display_tag
+        name = f"{acc.alias} ({email})" if acc.alias else email
+        return name, tag
+
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
-        entries: MenuEntries = [
-            (
-                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
-                f"  [{acc.display_tag}]",
-                f"remove:{acc.number}",
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name, tag = self._display_parts(acc)
+            entries.append(
+                (f"{acc.number}  {name}  [{tag}]", f"remove:{acc.number}")
             )
-            for acc in (snap.accounts if snap else ())
-        ]
         entries.append(_BACK)
         return entries
 
@@ -110,7 +117,7 @@ class DashboardScreen(Screen):
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
-            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            name, _tag = self._display_parts(acc)
             action = "→ enable" if acc.disabled else "→ disable"
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
@@ -163,6 +170,7 @@ class DashboardScreen(Screen):
             "auto": app.action_open_auto,
             "add-login": app.action_add_current,
             "add-token": app.action_add_token,
+            "privacy": app.action_toggle_privacy,
             "quit": app.exit,
         }
         if action_id == "back":

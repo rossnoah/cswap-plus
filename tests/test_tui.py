@@ -666,6 +666,7 @@ class TestDashboard:
                 "disable-menu",
                 "remove-menu",
                 "theme-menu",
+                "privacy",
                 "quit",
             ]
             # nest into Add (index 3), then back out with escape
@@ -1479,3 +1480,115 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+# ---------------------------------------------------------------------------
+# Privacy wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPrivacy:
+    async def test_p_key_masks_panel_and_persists(self, tmp_path):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        fake = FakeSwitcher(
+            [make_account("1", active=True), make_account("2")], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel)
+            assert "user1@example.com" in panel.render().plain
+            await pilot.press("p")
+            await settle(pilot)
+            assert app.privacy is True
+            plain = panel.render().plain
+            assert "user1@example.com" not in plain
+            assert "user2@example.com" not in plain
+            assert "u•••@e•••" in plain
+            saved = json.loads((tmp_path / "settings.json").read_text())
+            assert saved["ui"]["privacy"] is True
+
+    async def test_mount_starts_masked_from_settings(self, tmp_path):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"privacy": True}})
+        )
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            assert app.privacy is True
+            plain = app.screen.query_one(AccountsPanel).render().plain
+            assert "user1@example.com" not in plain
+
+    async def test_toggle_off_unmasks_and_persists(self, tmp_path):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"privacy": True}})
+        )
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await pilot.press("p")
+            await settle(pilot)
+            assert app.privacy is False
+            assert "user1@example.com" in (
+                app.screen.query_one(AccountsPanel).render().plain
+            )
+            saved = json.loads((tmp_path / "settings.json").read_text())
+            assert saved["ui"]["privacy"] is False
+
+    async def test_menu_entry_toggles_privacy(self, tmp_path):
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "privacy")
+            await settle(pilot)
+            assert app.privacy is True
+
+    async def test_remove_menu_masks_emails(self, tmp_path):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import MenuItem
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"privacy": True}})
+        )
+        fake = FakeSwitcher(
+            [make_account("1", active=True), make_account("2")], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "remove-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [
+                it.query_one(Static).render().plain for it in menu.query(MenuItem)
+            ]
+            joined = "\n".join(labels)
+            assert "user1@example.com" not in joined
+            assert "u•••@e•••" in joined
+
+    async def test_switch_screen_cards_masked(self, tmp_path):
+        from claude_swap.tui.widgets import AccountCard
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"privacy": True}})
+        )
+        fake = FakeSwitcher(
+            [make_account("1", active=True), make_account("2")], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            plains = [c.render().plain for c in app.screen.query(AccountCard)]
+            assert plains
+            assert all("example.com" not in p for p in plains)
