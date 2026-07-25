@@ -391,7 +391,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         import_fn.assert_called_once_with(
-            switcher_cls.return_value, "/tmp/x", force=True
+            switcher_cls.return_value, "/tmp/x", force=True, heal_live=False
         )
 
     def test_upgrade_in_help(self):

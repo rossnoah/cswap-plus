@@ -2347,3 +2347,18 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestSwitchOrigin:
+    def test_engine_switches_with_auto_origin(self, harness):
+        with patch.object(
+            harness.switcher,
+            "switch_to",
+            return_value={"switched": True, "from": {"number": 1},
+                          "to": {"number": 2}, "warnings": []},
+        ) as st:
+            harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(50),
+            })
+        assert st.called
+        assert st.call_args.kwargs.get("origin") == "auto"

@@ -58,15 +58,16 @@ class TestPull:
         envelope = b'{"version": 1, "accounts": []}'
         seen = {}
 
-        def fake_import(sw, source, force=False):
+        def fake_import(sw, source, force=False, heal_live=False):
             seen["bytes"] = open(source, "rb").read()
             seen["force"] = force
+            seen["heal_live"] = heal_live
 
         with patch.object(sync, "_run_remote", return_value=_proc(0, envelope)) as rr, \
              patch.object(sync, "import_accounts", side_effect=fake_import):
             sync.pull_from_peer(switcher, "mm", force=True)
         assert rr.call_args.args == ("mm", "export -")
-        assert seen == {"bytes": envelope, "force": True}
+        assert seen == {"bytes": envelope, "force": True, "heal_live": True}
         assert not list(tmp_path.glob(".sync-pull-*"))
 
     def test_pull_remote_failure_raises_with_stderr_tail(self, tmp_path):
@@ -100,10 +101,29 @@ class TestPush:
             sync.push_to_peer(switcher, "ubuntu", force=True)
         host, remote_args = rr.call_args.args[:2]
         assert host == "ubuntu"
-        assert remote_args == "import - --force"
+        assert remote_args == "import - --force --heal-live"
         assert rr.call_args.args[2] == b"ENVELOPE"
         assert "Done: 1 imported" in capsys.readouterr().out
         assert not list(tmp_path.glob(".sync-push-*"))
+
+    def test_push_retries_without_heal_live_for_old_peer(self, tmp_path, capsys):
+        switcher = FakeSwitcher(tmp_path)
+
+        def fake_export(sw, destination, account=None, full=False):
+            with open(destination, "wb") as fh:
+                fh.write(b"ENVELOPE")
+
+        # argparse on an old peer rejects the unknown flag with exit code 2;
+        # the push must retry once with the plain form.
+        procs = [_proc(2, b"", b"unrecognized arguments: --heal-live"),
+                 _proc(0, b"Done: 1 imported\n")]
+        with patch.object(sync, "export_accounts", side_effect=fake_export), \
+             patch.object(sync, "_run_remote", side_effect=procs) as rr:
+            sync.push_to_peer(switcher, "ubuntu")
+        assert [c.args[1] for c in rr.call_args_list] == [
+            "import - --heal-live", "import -",
+        ]
+        assert "no live-heal (older cswap?)" in capsys.readouterr().out
 
     def test_push_remote_failure_raises(self, tmp_path):
         switcher = FakeSwitcher(tmp_path)
@@ -128,7 +148,8 @@ class TestSyncPeers:
 
         with patch.object(sync, "pull_from_peer", side_effect=fake_pull), \
              patch.object(sync, "push_to_peer", side_effect=fake_push), \
-             patch.object(sync, "gossip_usage"):
+             patch.object(sync, "gossip_usage"), \
+             patch.object(sync, "gossip_active"):
             failures = sync.sync_peers(switcher, ["bad", "good"])
         assert failures == 1
         assert calls == [("pull", "good"), ("push", "good")]
@@ -138,7 +159,8 @@ class TestSyncPeers:
         switcher = FakeSwitcher(tmp_path)
         with patch.object(sync, "pull_from_peer") as pull, \
              patch.object(sync, "push_to_peer") as push, \
-             patch.object(sync, "gossip_usage"):
+             patch.object(sync, "gossip_usage"), \
+             patch.object(sync, "gossip_active"):
             sync.sync_peers(switcher, ["mm"], push=False)
             assert pull.called and not push.called
             pull.reset_mock()
@@ -223,3 +245,250 @@ class TestSyncCli:
         code, _, err = self._run(["add", "mm", "--force"], tmp_path, capsys)
         assert code == 1
         assert "takes no sync options" in err
+
+
+class IntentSwitcher:
+    """Fake switcher with enough surface for apply_active/gossip_active."""
+
+    def __init__(self, backup_dir, accounts=None, current=None, live=None):
+        self.backup_dir = backup_dir
+        # accounts: {slot: (email, org)}; current: active slot; live: bool
+        self.accounts = accounts or {"1": ("a@x.com", ""), "2": ("b@x.com", "")}
+        self.current = current
+        self.live = live if live is not None else current is not None
+        self.switch_calls = []
+        self.switch_result = {"switched": True, "warnings": []}
+
+    def _get_sequence_data(self):
+        return {
+            "accounts": {
+                num: {"email": e, "organizationUuid": org}
+                for num, (e, org) in self.accounts.items()
+            }
+        }
+
+    def _find_account_slot(self, data, email, org_uuid):
+        for num, acc in data.get("accounts", {}).items():
+            if acc["email"] == email and acc["organizationUuid"] == (org_uuid or ""):
+                return num
+        return None
+
+    def current_account_number(self):
+        return self.current
+
+    def has_live_login(self):
+        return self.live
+
+    def switch_to(self, slot, json_output=False, force=False, origin="manual"):
+        self.switch_calls.append((slot, force, origin))
+        return dict(self.switch_result)
+
+
+def _intent(email="b@x.com", ts=100.0, device="peer-dev", kind="manual"):
+    return {
+        "email": email, "organizationUuid": "", "ts": ts,
+        "originDeviceId": device, "originKind": kind, "adoptedFrom": None,
+    }
+
+
+def _payload(intent):
+    return {"schemaVersion": 1, "intent": intent}
+
+
+class TestApplyActive:
+    def test_malformed_payload_raises(self, tmp_path):
+        with pytest.raises(SyncError):
+            sync.apply_active(IntentSwitcher(tmp_path), {"schemaVersion": 7})
+        with pytest.raises(SyncError):
+            sync.apply_active(
+                IntentSwitcher(tmp_path), _payload({"email": ""})
+            )
+
+    def test_null_intent_is_noop(self, tmp_path):
+        res = sync.apply_active(IntentSwitcher(tmp_path), _payload(None))
+        assert res["status"] == "noop" and res["reason"] == "no-intent"
+
+    def test_own_intent_echo_guard(self, tmp_path):
+        config = sync.load_sync_config(tmp_path)  # mints deviceId
+        sw = IntentSwitcher(tmp_path, current="1")
+        res = sync.apply_active(
+            sw, _payload(_intent(device=config.device_id))
+        )
+        assert res["reason"] == "own-intent"
+        assert sw.switch_calls == []
+
+    def test_not_newer_lww_noop(self, tmp_path):
+        from claude_swap import active_intent
+
+        active_intent.adopt_intent(tmp_path, _intent(ts=200.0), source="mm")
+        sw = IntentSwitcher(tmp_path, current="1")
+        res = sync.apply_active(sw, _payload(_intent(ts=150.0)))
+        assert res["reason"] == "not-newer"
+        assert sw.switch_calls == []
+
+    def test_follow_disabled_adopts_but_never_switches(self, tmp_path):
+        from claude_swap import active_intent
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "sync.followRemoteSwitches", "false")
+        sw = IntentSwitcher(tmp_path, current="1")
+        res = sync.apply_active(sw, _payload(_intent()), source="mm")
+        assert res["status"] == "skipped"
+        assert res["reason"] == "follow-disabled"
+        assert sw.switch_calls == []
+        # Adopted anyway: this device relays the intent onward at sync time.
+        stored = active_intent.load_intent(tmp_path)
+        assert stored["ts"] == 100.0 and stored["adoptedFrom"] == "mm"
+
+    def test_unknown_account_skipped_and_not_recorded(self, tmp_path):
+        from claude_swap import active_intent
+
+        sw = IntentSwitcher(tmp_path, current="1")
+        res = sync.apply_active(sw, _payload(_intent(email="who@x.com")))
+        assert res["reason"] == "unknown-account"
+        assert active_intent.load_intent(tmp_path) is None  # retries later
+
+    def test_already_active_adopts_as_noop(self, tmp_path):
+        from claude_swap import active_intent
+
+        sw = IntentSwitcher(tmp_path, current="2")
+        res = sync.apply_active(sw, _payload(_intent()), source="mm")
+        assert res["status"] == "noop" and res["reason"] == "already-active"
+        assert sw.switch_calls == []
+        assert active_intent.load_intent(tmp_path)["ts"] == 100.0
+
+    def test_unmanaged_live_login_blocks(self, tmp_path):
+        from claude_swap import active_intent
+
+        sw = IntentSwitcher(tmp_path, current=None, live=True)
+        res = sync.apply_active(sw, _payload(_intent()))
+        assert res["reason"] == "unmanaged-live-login"
+        assert sw.switch_calls == []
+        assert active_intent.load_intent(tmp_path) is None
+
+    def test_applied_switches_with_remote_origin_and_records(self, tmp_path):
+        from claude_swap import active_intent
+
+        sw = IntentSwitcher(tmp_path, current="1")
+        res = sync.apply_active(sw, _payload(_intent()), source="mm")
+        assert res["status"] == "applied"
+        assert sw.switch_calls == [("2", False, "remote")]
+        assert active_intent.load_intent(tmp_path)["originDeviceId"] == "peer-dev"
+
+    def test_switch_failure_not_recorded(self, tmp_path):
+        from claude_swap import active_intent
+
+        sw = IntentSwitcher(tmp_path, current="1")
+        sw.switch_result = {"switched": False, "reason": "no-valid-target",
+                            "message": "nope"}
+        res = sync.apply_active(sw, _payload(_intent()))
+        assert res["reason"] == "switch-failed"
+        assert active_intent.load_intent(tmp_path) is None
+
+
+class TestBroadcastActive:
+    def test_parallel_results_include_failures(self, tmp_path):
+        sw = IntentSwitcher(tmp_path)
+
+        def fake_remote(host, args, stdin=None, timeout_s=None):
+            assert args == "sync apply-active -"
+            assert json.loads(stdin)["intent"]["email"] == "b@x.com"
+            if host == "down":
+                return _proc(255, b"", b"ssh: connect refused\n")
+            return _proc(0, b"switch intent: applied \xe2\x80\x94 ok\n")
+
+        with patch.object(sync, "_run_remote", side_effect=fake_remote):
+            results = sync.broadcast_active(sw, _intent(), ("mm", "down"))
+        by_host = {r["host"]: r for r in results}
+        assert by_host["mm"]["ok"] is True
+        assert by_host["down"]["ok"] is False
+        assert "refused" in by_host["down"]["detail"]
+
+    def test_ssh_missing_degrades(self, tmp_path):
+        sw = IntentSwitcher(tmp_path)
+        with patch.object(sync, "_run_remote",
+                          side_effect=SyncError("ssh not found on PATH")):
+            results = sync.broadcast_active(sw, _intent(), ("mm",))
+        assert results[0]["ok"] is False
+
+
+class TestGossipActive:
+    def test_pull_applies_and_reports(self, tmp_path, capsys):
+        sw = IntentSwitcher(tmp_path, current="1")
+        payload = json.dumps(_payload(_intent(ts=100.0))).encode()
+        with patch.object(sync, "_run_remote", return_value=_proc(0, payload)):
+            sync.gossip_active(sw, "mm", pull=True, push=False)
+        assert sw.switch_calls == [("2", False, "remote")]
+        assert "following switch" in capsys.readouterr().out
+
+    def test_old_peer_degrades_quietly(self, tmp_path, capsys):
+        sw = IntentSwitcher(tmp_path, current="1")
+        with patch.object(sync, "_run_remote", return_value=_proc(1, b"", b"")):
+            sync.gossip_active(sw, "mm", pull=True, push=True)
+        out = capsys.readouterr().out
+        assert "older cswap" in out
+
+    def test_push_skipped_without_local_intent(self, tmp_path):
+        sw = IntentSwitcher(tmp_path)
+        with patch.object(sync, "_run_remote") as rr:
+            sync.gossip_active(sw, "mm", pull=False, push=True)
+        assert not rr.called
+
+    def test_sync_peers_runs_account_sync_before_intent(self, tmp_path):
+        sw = IntentSwitcher(tmp_path)
+        order = []
+        with patch.object(sync, "pull_from_peer",
+                          side_effect=lambda *a, **k: order.append("pull")), \
+             patch.object(sync, "push_to_peer",
+                          side_effect=lambda *a, **k: order.append("push")), \
+             patch.object(sync, "gossip_usage",
+                          side_effect=lambda *a, **k: order.append("usage")), \
+             patch.object(sync, "gossip_active",
+                          side_effect=lambda *a, **k: order.append("active")):
+            sync.sync_peers(sw, ["mm"])
+        assert order.index("active") > order.index("pull")
+        assert order.index("active") > order.index("push")
+
+
+class TestIntentLoopScenario:
+    def test_three_device_fleet_converges_without_echo(self, tmp_path):
+        """Mac switches; mm and ubuntu follow; later syncs are all no-ops."""
+        from claude_swap import active_intent
+
+        roots = {}
+        devices = {}
+        for name in ("mac", "mm", "ubuntu"):
+            root = tmp_path / name
+            root.mkdir()
+            roots[name] = root
+            devices[name] = sync.load_sync_config(root).device_id
+
+        # Mac mints the intent (as _announce_switch would).
+        intent = active_intent.record_local_intent(
+            roots["mac"], email="b@x.com", org_uuid="",
+            device_id=devices["mac"], kind="manual",
+        )
+
+        applies = []
+
+        def apply_on(name, source):
+            sw = IntentSwitcher(
+                roots[name],
+                current="2" if active_intent.load_intent(roots[name]) else "1",
+            )
+            res = sync.apply_active(sw, _payload(intent), source=source)
+            applies.append((name, res["status"], len(sw.switch_calls)))
+            return res
+
+        # Push from the Mac to both peers: both switch exactly once.
+        assert apply_on("mm", "mac")["status"] == "applied"
+        assert apply_on("ubuntu", "mac")["status"] == "applied"
+        # mm later syncs with ubuntu: LWW makes both directions no-ops.
+        assert apply_on("ubuntu", "mm")["status"] == "noop"
+        assert apply_on("mm", "ubuntu")["status"] == "noop"
+        # The Mac pulls its own intent back: echo guard.
+        mac_sw = IntentSwitcher(roots["mac"], current="2")
+        res = sync.apply_active(mac_sw, _payload(intent), source="mm")
+        assert res["reason"] == "own-intent"
+        # Exactly two switches happened fleet-wide.
+        assert sum(n for _, _, n in applies) == 2

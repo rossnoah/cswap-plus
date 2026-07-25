@@ -6553,6 +6553,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            origin="manual",
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(
@@ -6946,3 +6947,122 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestAnnounceSwitch:
+    """The post-switch broadcast hook (fleet active-intent sync)."""
+
+    def _switcher(self, with_sync=True, peers=("mm",)):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        if with_sync:
+            from claude_swap import sync as sync_mod
+
+            sync_mod.load_sync_config(switcher.backup_dir)  # mint deviceId
+            for host in peers:
+                sync_mod.add_peer(switcher.backup_dir, host)
+        return switcher
+
+    def test_manual_origin_records_and_pushes(self, temp_home: Path):
+        from claude_swap import active_intent
+
+        switcher = self._switcher()
+        with patch(
+            "claude_swap.sync.broadcast_active",
+            return_value=[{"host": "mm", "ok": True, "detail": ""}],
+        ) as bc:
+            out = switcher._announce_switch(
+                "2", "b@x.com", "", origin="manual", emit_output=False,
+                warnings_out=[],
+            )
+        assert bc.called
+        assert out and out[0]["ok"]
+        intent = active_intent.load_intent(switcher.backup_dir)
+        assert intent["email"] == "b@x.com"
+        assert intent["originKind"] == "manual"
+
+    def test_remote_origins_never_reannounce(self, temp_home: Path):
+        from claude_swap import active_intent
+
+        switcher = self._switcher()
+        for origin in ("remote", "remote-heal"):
+            with patch("claude_swap.sync.broadcast_active") as bc:
+                out = switcher._announce_switch(
+                    "2", "b@x.com", "", origin=origin, emit_output=False,
+                    warnings_out=[],
+                )
+            assert out == [] and not bc.called
+        assert active_intent.load_intent(switcher.backup_dir) is None
+
+    def test_suppress_broadcast_skips_record_and_push(self, temp_home: Path):
+        from claude_swap import active_intent
+
+        switcher = self._switcher()
+        switcher.suppress_broadcast = True
+        with patch("claude_swap.sync.broadcast_active") as bc:
+            out = switcher._announce_switch(
+                "2", "b@x.com", "", origin="manual", emit_output=False,
+                warnings_out=[],
+            )
+        assert out == [] and not bc.called
+        assert active_intent.load_intent(switcher.backup_dir) is None
+
+    def test_no_sync_json_is_a_noop(self, temp_home: Path):
+        from claude_swap import active_intent
+
+        switcher = self._switcher(with_sync=False)
+        with patch("claude_swap.sync.broadcast_active") as bc:
+            out = switcher._announce_switch(
+                "2", "b@x.com", "", origin="manual", emit_output=False,
+                warnings_out=[],
+            )
+        assert out == [] and not bc.called
+        assert active_intent.load_intent(switcher.backup_dir) is None
+
+    def test_auto_origin_records_but_pushes_only_when_enabled(
+        self, temp_home: Path,
+    ):
+        from claude_swap import active_intent
+        from claude_swap.settings import set_setting
+
+        switcher = self._switcher()
+        with patch("claude_swap.sync.broadcast_active") as bc:
+            switcher._announce_switch(
+                "2", "b@x.com", "", origin="auto", emit_output=False,
+                warnings_out=[],
+            )
+        assert not bc.called  # broadcastAutoSwitches defaults false
+        assert active_intent.load_intent(switcher.backup_dir)["originKind"] == "auto"
+
+        set_setting(switcher.backup_dir, "sync.broadcastAutoSwitches", "true")
+        with patch("claude_swap.sync.broadcast_active", return_value=[]) as bc:
+            switcher._announce_switch(
+                "2", "b@x.com", "", origin="auto", emit_output=False,
+                warnings_out=[],
+            )
+        assert bc.called
+
+    def test_broadcast_failure_never_raises(self, temp_home: Path):
+        switcher = self._switcher()
+        warnings_out: list[str] = []
+        with patch(
+            "claude_swap.sync.broadcast_active", side_effect=RuntimeError("boom")
+        ):
+            out = switcher._announce_switch(
+                "2", "b@x.com", "", origin="manual", emit_output=False,
+                warnings_out=warnings_out,
+            )
+        assert out == []
+
+    def test_push_failure_lands_in_warnings_in_json_mode(self, temp_home: Path):
+        switcher = self._switcher()
+        warnings_out: list[str] = []
+        with patch(
+            "claude_swap.sync.broadcast_active",
+            return_value=[{"host": "mm", "ok": False, "detail": "unreachable"}],
+        ):
+            switcher._announce_switch(
+                "2", "b@x.com", "", origin="manual", emit_output=False,
+                warnings_out=warnings_out,
+            )
+        assert warnings_out and "mm" in warnings_out[0]

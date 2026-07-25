@@ -277,6 +277,9 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
         # (budget share, device id) — see _poll_share_inputs.
         self._poll_share_cache: tuple[int, str] | None = None
+        # --no-broadcast: keep this process's switches off the sync fleet
+        # (no intent record, no push) — see _announce_switch.
+        self.suppress_broadcast = False
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -2980,6 +2983,66 @@ class ClaudeAccountSwitcher:
                 f"Post-switch poll re-plan failed (switch itself succeeded): {e}"
             )
 
+    def _announce_switch(
+        self,
+        target_account: str,
+        target_email: str,
+        org_uuid: str,
+        *,
+        origin: str,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> list[dict]:
+        """Record this switch as the fleet's active intent and push it to peers.
+
+        Runs after the switch has committed and every lock is released — same
+        best-effort contract as ``_replan_new_active``: nothing here may fail
+        the switch. Remote-originated switches (``origin`` remote/remote-heal)
+        are never re-announced; that, plus the strictly-newer LWW rule on the
+        receiving side, is what keeps a pushed switch from echoing around the
+        fleet. The intent is recorded even when pushing is disabled so
+        ``cswap sync`` can still carry it later.
+        """
+        if origin in ("remote", "remote-heal") or self.suppress_broadcast:
+            return []
+        try:
+            from claude_swap import active_intent, sync
+            from claude_swap.settings import load_sync_section_settings
+
+            config = sync.load_sync_config(self.backup_dir, create=False)
+            if not config.device_id:
+                return []  # never synced — fleet of one, zero overhead
+            intent = active_intent.record_local_intent(
+                self.backup_dir,
+                email=target_email,
+                org_uuid=org_uuid,
+                device_id=config.device_id,
+                kind="auto" if origin == "auto" else "manual",
+            )
+            settings = load_sync_section_settings(self.backup_dir)
+            should_push = (
+                settings.broadcast_switches
+                if intent["originKind"] == "manual"
+                else settings.broadcast_auto_switches
+            )
+            if not should_push or not config.peers:
+                return []
+            results = sync.broadcast_active(self, intent, config.peers)
+            summary = ", ".join(
+                f"{r['host']} {'✓' if r['ok'] else '✗ (' + r['detail'] + ')'}"
+                for r in results
+            )
+            if emit_output:
+                print(dimmed(f"Pushed switch to {summary}"))
+            elif any(not r["ok"] for r in results):
+                warnings_out.append(f"switch push incomplete: {summary}")
+            return results
+        except Exception as e:
+            self._logger.warning(
+                f"Switch broadcast failed (switch itself succeeded): {e}"
+            )
+            return []
+
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → decision-grade usage value for managed accounts."""
         accounts_info = self._build_accounts_info()
@@ -3485,7 +3548,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -3495,6 +3558,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if op.get("broadcast"):
+            result["broadcast"] = op["broadcast"]
+        return result
 
     def _switch_noop(
         self,
@@ -3918,13 +3984,23 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        *,
+        origin: str = "manual",
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``origin`` says who asked — ``manual`` (CLI/TUI/menubar), ``auto``
+        (the auto engine), ``remote`` (a peer's pushed switch), or
+        ``remote-heal`` (sync repairing the live login). It decides whether
+        the switch is announced to sync peers; remote origins never are.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -4023,6 +4099,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            origin=origin,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -4320,6 +4397,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        origin: str = "manual",
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -4563,12 +4641,17 @@ class ClaudeAccountSwitcher:
                     print()
                     self._print_switch_followup()
                     print()
-                self._replan_new_active(
-                    target_account,
-                    target_email,
-                    data["accounts"][target_account].get("organizationUuid", ""),
+                org_uuid = data["accounts"][target_account].get("organizationUuid", "")
+                self._replan_new_active(target_account, target_email, org_uuid)
+                broadcast = self._announce_switch(
+                    target_account, target_email, org_uuid,
+                    origin=origin, emit_output=emit_output,
+                    warnings_out=warnings_out,
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                return {
+                    "from": from_ref, "to": to_ref,
+                    "warnings": warnings_out, "broadcast": broadcast,
+                }
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -4789,12 +4872,16 @@ class ClaudeAccountSwitcher:
             print()
             self._print_switch_followup()
             print()
-        self._replan_new_active(
-            target_account,
-            target_email,
-            data["accounts"][target_account].get("organizationUuid", ""),
+        org_uuid = data["accounts"][target_account].get("organizationUuid", "")
+        self._replan_new_active(target_account, target_email, org_uuid)
+        broadcast = self._announce_switch(
+            target_account, target_email, org_uuid,
+            origin=origin, emit_output=emit_output, warnings_out=warnings_out,
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref, "to": to_ref,
+            "warnings": warnings_out, "broadcast": broadcast,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

@@ -507,6 +507,20 @@ Examples:
             merged = sync_mod.absorb_usage(switcher, payload)
             print(f"usage: adopted {merged} fresher measurement(s)")
             return
+        if verb == "emit-active":
+            print(sync_mod.emit_active(switcher))
+            return
+        if verb == "apply-active":
+            try:
+                payload = json.loads(sys.stdin.read())
+            except json.JSONDecodeError as exc:
+                error(f"Error: invalid intent payload: {exc}")
+                sys.exit(1)
+            res = sync_mod.apply_active(switcher, payload)
+            # Policy outcomes (follow off, unknown account, …) are normal
+            # exits: a declining peer must not count as a sync failure.
+            print(f"switch intent: {res['status']} — {res['detail']}")
+            return
         if verb in ("add", "remove", "list"):
             if args.pull or args.push or args.force or args.full:
                 error(f"Error: 'sync {verb}' takes no sync options")
@@ -1177,6 +1191,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
     )
+    parser.add_argument(
+        "--no-broadcast",
+        action="store_true",
+        help=(
+            "Keep this switch on this device only — do not push it to sync "
+            "peers or carry it in later syncs"
+        ),
+    )
+    parser.add_argument(
+        "--heal-live",
+        action="store_true",
+        help=(
+            "With 'import': if the payload carries a newer credential "
+            "generation for the current live login, activate it in place "
+            "(used by cswap sync)"
+        ),
+    )
 
     # Legacy `--flag` interface. Still fully supported (bare subcommands rewrite
     # into these, see _translate_subcommand), but hidden from --help so the
@@ -1355,6 +1386,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     payload: dict | None = None
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if args.no_broadcast:
+            switcher.suppress_broadcast = True
 
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":
@@ -1418,7 +1451,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.import_:
             from claude_swap.transfer import import_accounts
 
-            import_accounts(switcher, args.import_, force=args.force)
+            import_accounts(
+                switcher, args.import_, force=args.force,
+                heal_live=args.heal_live,
+            )
         elif args.tui:
             from claude_swap.tui import run as tui_run
 

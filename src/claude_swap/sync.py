@@ -22,10 +22,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap import active_intent
 from claude_swap.exceptions import SyncError
 from claude_swap.printer import accent, dimmed, warning
 from claude_swap.settings import atomic_write_json
@@ -120,7 +123,11 @@ def remove_peer(backup_root: Path, host: str) -> bool:
 
 
 def _run_remote(
-    host: str, remote_args: str, stdin_bytes: bytes | None = None
+    host: str,
+    remote_args: str,
+    stdin_bytes: bytes | None = None,
+    *,
+    timeout_s: float = _REMOTE_TIMEOUT_S,
 ) -> subprocess.CompletedProcess:
     cmd = ["ssh", *_SSH_OPTS, "--", host, f"{_REMOTE_CSWAP} {remote_args}"]
     try:
@@ -128,7 +135,7 @@ def _run_remote(
             cmd,
             input=stdin_bytes,
             capture_output=True,
-            timeout=_REMOTE_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except FileNotFoundError:
         raise SyncError("ssh not found on PATH") from None
@@ -155,7 +162,7 @@ def pull_from_peer(switcher, host: str, *, force: bool = False) -> None:
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(proc.stdout)
-        import_accounts(switcher, tmp, force=force)
+        import_accounts(switcher, tmp, force=force, heal_live=True)
     finally:
         try:
             os.unlink(tmp)
@@ -187,7 +194,13 @@ def push_to_peer(
             os.unlink(tmp)
         except OSError:
             pass
-    proc = _run_remote(host, "import -" + (" --force" if force else ""), envelope)
+    import_args = "import -" + (" --force" if force else "")
+    proc = _run_remote(host, f"{import_args} --heal-live", envelope)
+    if proc.returncode == 2:
+        # argparse exit code for an unknown flag: the peer runs an older
+        # cswap without --heal-live. One extra round-trip, old behavior.
+        print(dimmed(f"  {host}: no live-heal (older cswap?)"))
+        proc = _run_remote(host, import_args, envelope)
     if proc.returncode != 0:
         raise _remote_error(host, proc)
     out = proc.stdout.decode(errors="replace").strip()
@@ -254,6 +267,184 @@ def gossip_usage(switcher, host: str, *, pull: bool, push: bool) -> None:
         warning(f"  usage gossip with {host} skipped: {exc}")
 
 
+# --- Active-account intent: broadcast on switch, gossip at sync time ------
+
+_BROADCAST_TIMEOUT_S = 15
+
+
+def _age(ts: float) -> str:
+    delta = max(0.0, time.time() - ts)
+    if delta < 90:
+        return f"{int(delta)}s ago"
+    if delta < 5400:
+        return f"{int(delta / 60)}m ago"
+    return f"{delta / 3600:.1f}h ago"
+
+
+def emit_active(switcher) -> str:
+    """This device's active-intent record (or null) as a gossip payload."""
+    return json.dumps(
+        {
+            "schemaVersion": active_intent.INTENT_SCHEMA_VERSION,
+            "intent": active_intent.load_intent(switcher.backup_dir),
+        }
+    )
+
+
+def apply_active(switcher, payload: object, *, source: str = "") -> dict:
+    """Consider a peer's active intent; follow it when it wins.
+
+    Returns ``{"status", "reason", "detail"}`` — ``applied`` (switched and
+    recorded), ``noop`` (nothing to do), or ``skipped`` (policy or state
+    stopped us; not recorded, so a later sync retries). Every policy outcome
+    is a normal return: only a malformed payload raises.
+    """
+    if not isinstance(payload, dict) or payload.get(
+        "schemaVersion"
+    ) != active_intent.INTENT_SCHEMA_VERSION:
+        raise SyncError("unrecognized active-intent payload")
+    if payload.get("intent") is None:
+        return {"status": "noop", "reason": "no-intent", "detail": "peer has no intent"}
+    intent = active_intent.validate_intent(payload)
+    if intent is None:
+        raise SyncError("unrecognized active-intent payload")
+
+    backup_root = switcher.backup_dir
+    email = intent["email"]
+    config = load_sync_config(backup_root, create=False)
+    if config.device_id and intent["originDeviceId"] == config.device_id:
+        # Our own intent coming back around the fleet — the echo guard.
+        return {"status": "noop", "reason": "own-intent", "detail": "originated here"}
+    current = active_intent.load_intent(backup_root)
+    if not active_intent.is_newer(intent, current):
+        return {"status": "noop", "reason": "not-newer", "detail": "already have it"}
+
+    from claude_swap.settings import load_sync_section_settings
+
+    if not load_sync_section_settings(backup_root).follow_remote_switches:
+        # Still adopt the record so this device relays it onward at its own
+        # next sync — following and relaying are different decisions.
+        active_intent.adopt_intent(backup_root, intent, source=source)
+        return {
+            "status": "skipped",
+            "reason": "follow-disabled",
+            "detail": "not following (sync.followRemoteSwitches=false)",
+        }
+
+    data = switcher._get_sequence_data() or {}
+    slot = switcher._find_account_slot(data, email, intent["organizationUuid"])
+    if slot is None:
+        # Not recorded: once account sync delivers this identity, the same
+        # intent applies cleanly on retry.
+        return {
+            "status": "skipped",
+            "reason": "unknown-account",
+            "detail": f"{email} is not managed here (run: cswap sync)",
+        }
+    current_slot = switcher.current_account_number()
+    if current_slot == slot:
+        active_intent.adopt_intent(backup_root, intent, source=source)
+        return {"status": "noop", "reason": "already-active", "detail": f"already on {email}"}
+    if current_slot is None and switcher.has_live_login():
+        # A live login cswap doesn't manage was made deliberately out-of-band;
+        # a remote intent must not clobber it.
+        return {
+            "status": "skipped",
+            "reason": "unmanaged-live-login",
+            "detail": "live login is not cswap-managed",
+        }
+
+    result = switcher.switch_to(slot, json_output=True, origin="remote")
+    if not result or not (result.get("switched") or result.get("reason") == "activated"):
+        detail = (result or {}).get("message", "switch did not complete")
+        return {"status": "skipped", "reason": "switch-failed", "detail": detail}
+    active_intent.adopt_intent(backup_root, intent, source=source)
+    warnings = result.get("warnings") or []
+    return {
+        "status": "applied",
+        "reason": "switched",
+        "detail": f"switched to {email}"
+        + (f" ({'; '.join(warnings)})" if warnings else ""),
+    }
+
+
+def broadcast_active(switcher, intent: dict, hosts: tuple[str, ...]) -> list[dict]:
+    """Push a just-minted intent to each peer in parallel, best-effort.
+
+    Runs right after a switch commits, so it is time-capped well below the
+    normal remote timeout: an unreachable peer dies at SSH's ConnectTimeout
+    and a wedged one at ``_BROADCAST_TIMEOUT_S``. Old peers (no verb) and
+    unreachable ones degrade alike — they catch up at the next sync.
+    """
+    payload = json.dumps(
+        {"schemaVersion": active_intent.INTENT_SCHEMA_VERSION, "intent": intent}
+    ).encode()
+
+    def push(host: str) -> dict:
+        try:
+            proc = _run_remote(
+                host, "sync apply-active -", payload, timeout_s=_BROADCAST_TIMEOUT_S
+            )
+        except SyncError as exc:
+            return {"host": host, "ok": False, "detail": str(exc)}
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode(errors="replace").strip()
+            tail = stderr.splitlines()[-1] if stderr else "unreachable"
+            return {"host": host, "ok": False, "detail": tail}
+        out = proc.stdout.decode(errors="replace").strip()
+        return {"host": host, "ok": True, "detail": out.splitlines()[-1] if out else ""}
+
+    with ThreadPoolExecutor(max_workers=min(len(hosts), 4)) as pool:
+        return list(pool.map(push, hosts))
+
+
+def gossip_active(switcher, host: str, *, pull: bool, push: bool) -> None:
+    """Trade active intent with a peer so switches survive unreachable
+    devices: the Mac (inbound-unreachable) adopts remote switches when it
+    initiates the sync, and a follow-off relay still hands intents onward.
+    Best-effort like usage gossip — account sync must not fail on it."""
+    try:
+        if pull:
+            proc = _run_remote(host, "sync emit-active")
+            if proc.returncode != 0:
+                print(dimmed(f"  {host}: no switch gossip (older cswap?)"))
+                return
+            res = apply_active(
+                switcher, json.loads(proc.stdout.decode()), source=host
+            )
+            if res["status"] == "applied":
+                intent = active_intent.load_intent(switcher.backup_dir) or {}
+                age = _age(float(intent.get("ts", time.time())))
+                print(
+                    f"  {accent('following switch')} to {intent.get('email', '?')} "
+                    f"from {host} ({age})"
+                )
+            elif res["status"] == "skipped":
+                print(dimmed(f"  switch intent from {host}: {res['detail']}"))
+        if push:
+            intent = active_intent.load_intent(switcher.backup_dir)
+            if intent is None:
+                return
+            proc = _run_remote(
+                host,
+                "sync apply-active -",
+                json.dumps(
+                    {
+                        "schemaVersion": active_intent.INTENT_SCHEMA_VERSION,
+                        "intent": intent,
+                    }
+                ).encode(),
+            )
+            if proc.returncode != 0:
+                print(dimmed(f"  {host}: no switch gossip (older cswap?)"))
+                return
+            out = proc.stdout.decode(errors="replace").strip()
+            if out and "noop" not in out:
+                print(f"  {dimmed(out.splitlines()[-1])}")
+    except (SyncError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        warning(f"  switch gossip with {host} skipped: {exc}")
+
+
 def sync_peers(
     switcher,
     hosts: list[str],
@@ -276,6 +467,8 @@ def sync_peers(
             if push:
                 push_to_peer(switcher, host, force=force, full=full)
             gossip_usage(switcher, host, pull=pull, push=push)
+            # After account pull/push so a just-delivered account resolves.
+            gossip_active(switcher, host, pull=pull, push=push)
         except SyncError as exc:
             warning(f"  {exc}")
             failures += 1
