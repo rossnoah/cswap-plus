@@ -82,7 +82,7 @@ class DashboardScreen(Screen):
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
-            ("Toggle privacy (p)", "privacy"),
+            ("Privacy", "privacy"),
             ("Quit", "quit"),
         ]
 
