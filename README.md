@@ -6,9 +6,11 @@ A fork of [claude-swap](https://github.com/realiti4/claude-swap) that adds:
   pulls from and pushes to every peer over SSH, reusing export/import's
   conflict rules (dead tokens healed, healthy accounts kept unless
   `--force`). Credentials only ever transit the SSH channel.
-- **Privacy mode** — press `p` in the TUI (or set `ui.privacy`) to mask
-  every email and org name to its first character (`n•••@g•••`), for
-  screen shares and screenshots. Slot numbers and aliases stay visible.
+- **Privacy mode** — press `p` in the TUI (or set `ui.privacy`) for
+  screen shares and screenshots: accounts render as `Account 1`,
+  `Account 2`, … and org names are hidden entirely. Slot numbers and
+  aliases stay visible; emails in captured command output fall back to a
+  character mask (`n•••@g•••`).
 - **Shared usage polling** — the usage API's request budget is per
   account token, shared by every device that polls it. `poll.budgetShare`
   (auto-derived from your sync peers) scales each device's poll intervals
@@ -18,7 +20,10 @@ A fork of [claude-swap](https://github.com/realiti4/claude-swap) that adds:
   paid for.
 - **Active-account sync** — switching on one device moves the fleet: the
   switch pushes to reachable peers immediately and `cswap sync` carries
-  it to the rest (last-writer-wins, echo-proof). Manual switches always
+  it to the rest (last-writer-wins, echo-proof). The account *list order*
+  syncs the same way — add/remove/swap/move stamps the device as the
+  latest layout author, and peers rearrange their slots to match on the
+  next sync. Manual switches always
   broadcast; `sync.broadcastAutoSwitches` opts the auto engine in,
   `sync.followRemoteSwitches` controls the receiving side, and
   `cswap switch <acct> --no-broadcast` keeps one switch local.

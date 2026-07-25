@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
 from claude_swap import oauth as oauth_mod
+from claude_swap import slot_order
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -278,6 +279,9 @@ def export_accounts(
         "swapVersion": __version__,
         "encrypted": False,
         "activeAccountNumber": active_in_payload,
+        # The layout-author stamp: each account's `number` above IS the
+        # layout; import rearranges to match when this stamp wins LWW.
+        "slotOrder": slot_order.load_order(switcher.backup_dir),
         "accounts": accounts_payload,
     }
 
@@ -654,6 +658,7 @@ def import_accounts(
     if identity is not None and final is not None:
         live_slot = switcher._find_account_slot(final, identity[0], identity[1])
         if live_slot is not None and live_slot in written_slots:
+            healed_live = False
             if heal_live and oauth_mod.is_fresher_generation(
                 written_creds.get(live_slot, ""),
                 switcher._read_credentials() or "",
@@ -673,8 +678,77 @@ def import_accounts(
                         f"manually with: cswap --switch-to {live_slot} --force"
                     )
                 else:
-                    return
-            _eprint(
-                f"Note: {identity[0]} is your current live login — activate the "
-                f"imported credentials with: cswap --switch-to {live_slot} --force"
+                    healed_live = True
+            if not healed_live:
+                _eprint(
+                    f"Note: {identity[0]} is your current live login — activate "
+                    f"the imported credentials with: "
+                    f"cswap --switch-to {live_slot} --force"
+                )
+
+    # Last, after every slot reference above has been resolved against the
+    # pre-move layout: rearrange local slots to match the envelope's when its
+    # layout stamp wins. Slot moves relocate everything slot-keyed (backups,
+    # aliases, activeAccountNumber, session profiles), so nothing above may
+    # run after this.
+    _apply_slot_order(switcher, envelope)
+
+
+def _apply_slot_order(switcher: ClaudeAccountSwitcher, envelope: dict) -> None:
+    """Rearrange local slots to match the envelope's layout when it wins.
+
+    The envelope's per-account ``number`` fields are the sender's layout;
+    ``slotOrder`` is its LWW author stamp. Strictly-newer wins; the stamp is
+    adopted verbatim afterwards (never re-originated — a restamp would make
+    this device the newest author and echo the layout back forever, which is
+    also why ``_suppress_order_stamp`` silences the move machinery's own
+    stamping here). Moves use ``move_account``, so occupants trade places and
+    nothing is ever lost; identities the envelope doesn't know keep whatever
+    slot the trades leave them in. Best-effort throughout: a failed move
+    warns and moves on, and never fails the import.
+    """
+    incoming = slot_order.validate_record(envelope.get("slotOrder"))
+    if incoming is None:
+        return
+    try:
+        from claude_swap.sync import load_sync_config
+
+        own_device = load_sync_config(switcher.backup_dir, create=False).device_id
+        if own_device and incoming["originDeviceId"] == own_device:
+            return  # our own layout coming back around the fleet
+        if not slot_order.is_newer(incoming, slot_order.load_order(switcher.backup_dir)):
+            return
+        moves = 0
+        entries = [
+            raw for raw in envelope.get("accounts") or []
+            if isinstance(raw, dict) and raw.get("email")
+        ]
+        for raw in sorted(entries, key=lambda a: int(a.get("number") or 0)):
+            desired = str(raw.get("number") or "")
+            if not desired.isdigit() or int(desired) < 1:
+                continue
+            data = switcher._get_sequence_data() or {}
+            current = switcher._find_account_slot(
+                data, raw["email"], raw.get("organizationUuid") or ""
             )
+            if current is None or current == desired:
+                continue
+            switcher._suppress_order_stamp = True
+            try:
+                switcher.move_account(current, desired)
+                moves += 1
+            except Exception as e:
+                _eprint(
+                    f"Warning: could not move {raw['email']} to slot "
+                    f"{desired}: {e}"
+                )
+            finally:
+                switcher._suppress_order_stamp = False
+        slot_order.adopt_record(
+            switcher.backup_dir, incoming,
+            source=envelope.get("exportedFrom") or "peer",
+        )
+        if moves:
+            _eprint(f"Reordered {moves} account(s) to match the fleet layout")
+    except Exception as e:
+        _eprint(f"Warning: slot-order reconciliation skipped: {e}")

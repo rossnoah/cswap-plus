@@ -280,6 +280,9 @@ class ClaudeAccountSwitcher:
         # --no-broadcast: keep this process's switches off the sync fleet
         # (no intent record, no push) — see _announce_switch.
         self.suppress_broadcast = False
+        # Sync-driven slot moves must not restamp this device as the layout
+        # author — see _record_slot_layout_change / transfer._apply_slot_order.
+        self._suppress_order_stamp = False
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -726,7 +729,31 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         with FileLock(self.lock_file):
-            return self._swap_accounts_locked(first, second)
+            result = self._swap_accounts_locked(first, second)
+        self._record_slot_layout_change()
+        return result
+
+    def _record_slot_layout_change(self) -> None:
+        """Stamp this device as the latest slot-layout author, best-effort.
+
+        Called after every explicit layout mutation (add/remove/swap/move) so
+        `cswap sync` can carry the ordering to peers. Sync-driven layout
+        application must NOT restamp (the receiver would become the newest
+        author and echo the same layout back forever) — transfer sets
+        ``_suppress_order_stamp`` around its moves. No sync.json → no stamp:
+        a fleet of one has nothing to order.
+        """
+        if getattr(self, "_suppress_order_stamp", False):
+            return
+        try:
+            from claude_swap import slot_order
+            from claude_swap.sync import load_sync_config
+
+            device_id = load_sync_config(self.backup_dir, create=False).device_id
+            if device_id:
+                slot_order.record_local_order(self.backup_dir, device_id)
+        except Exception as e:
+            self._logger.debug(f"slot-order stamp skipped: {e}")
 
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
@@ -1146,9 +1173,11 @@ class ClaudeAccountSwitcher:
             if data.get("accounts", {}).get(target):
                 # Occupied target: trade places, exactly `swap num_src target`.
                 self._swap_accounts_locked(num_src, target)
+                self._record_slot_layout_change()
                 return num_src, target, True
 
             self._relocate_locked(num_src, target)
+            self._record_slot_layout_change()
             return num_src, target, False
 
     def _relocate_locked(self, num_src: str, target: str) -> None:
@@ -2196,6 +2225,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        self._record_slot_layout_change()
 
     def add_account_from_token(
         self,
@@ -2403,6 +2433,7 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        self._record_slot_layout_change()
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -2488,6 +2519,7 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        self._record_slot_layout_change()
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 

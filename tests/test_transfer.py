@@ -1800,3 +1800,144 @@ class TestHealLive:
         err = capsys.readouterr().err
         assert "live-login heal failed" in err
         assert "--switch-to 1 --force" in err
+
+
+class TestSlotOrderSync:
+    """Import rearranges local slots to match a winning envelope layout."""
+
+    def _seeded(self, temp_home):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@x.com")
+        _seed_account(s, 2, "b@x.com")
+        _seed_account(s, 3, "c@x.com")
+        return s
+
+    def _envelope(self, layout, stamp):
+        # layout: {email: number}
+        return json.dumps({
+            "version": 1,
+            "encrypted": False,
+            "slotOrder": stamp,
+            "accounts": [
+                {
+                    "number": num,
+                    "email": email,
+                    "uuid": f"acct-{num}",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                    "credentials": {**SAMPLE_CREDS, "_marker": email},
+                    "config": {"oauthAccount": {"emailAddress": email}},
+                }
+                for email, num in layout.items()
+            ],
+        })
+
+    def _slots(self, switcher):
+        data = switcher._get_sequence_data() or {}
+        return {
+            acc["email"]: num for num, acc in data.get("accounts", {}).items()
+        }
+
+    def test_winning_stamp_rearranges(self, temp_home, capsys):
+        from claude_swap import slot_order
+
+        s = self._seeded(temp_home)
+        env = temp_home / "env.json"
+        env.write_text(self._envelope(
+            {"a@x.com": 3, "b@x.com": 1, "c@x.com": 2},
+            {"ts": 100.0, "originDeviceId": "peer-dev"},
+        ))
+        import_accounts(s, str(env))
+        assert self._slots(s) == {"b@x.com": "1", "c@x.com": "2", "a@x.com": "3"}
+        # Stamp adopted verbatim — NOT re-originated by the moves.
+        stored = slot_order.load_order(s.backup_dir)
+        assert stored["originDeviceId"] == "peer-dev"
+        assert stored["ts"] == 100.0
+        assert "Reordered" in capsys.readouterr().err
+
+    def test_stale_stamp_is_ignored(self, temp_home):
+        from claude_swap import slot_order
+
+        s = self._seeded(temp_home)
+        local = slot_order.record_local_order(s.backup_dir, "local-dev")
+        env = temp_home / "env.json"
+        env.write_text(self._envelope(
+            {"a@x.com": 3, "b@x.com": 1, "c@x.com": 2},
+            {"ts": local["ts"] - 10, "originDeviceId": "peer-dev"},
+        ))
+        import_accounts(s, str(env))
+        assert self._slots(s) == {"a@x.com": "1", "b@x.com": "2", "c@x.com": "3"}
+
+    def test_own_stamp_echo_ignored(self, temp_home):
+        from claude_swap import sync as sync_mod
+
+        s = self._seeded(temp_home)
+        own = sync_mod.load_sync_config(s.backup_dir).device_id
+        env = temp_home / "env.json"
+        env.write_text(self._envelope(
+            {"a@x.com": 2, "b@x.com": 1, "c@x.com": 3},
+            {"ts": 1e12, "originDeviceId": own},
+        ))
+        import_accounts(s, str(env))
+        assert self._slots(s) == {"a@x.com": "1", "b@x.com": "2", "c@x.com": "3"}
+
+    def test_no_stamp_no_moves(self, temp_home):
+        s = self._seeded(temp_home)
+        env = temp_home / "env.json"
+        env.write_text(self._envelope(
+            {"a@x.com": 3, "b@x.com": 1, "c@x.com": 2}, None,
+        ))
+        import_accounts(s, str(env))
+        assert self._slots(s) == {"a@x.com": "1", "b@x.com": "2", "c@x.com": "3"}
+
+    def test_local_only_account_survives_reorder(self, temp_home):
+        s = self._seeded(temp_home)
+        _seed_account(s, 4, "local-only@x.com")
+        env = temp_home / "env.json"
+        env.write_text(self._envelope(
+            {"a@x.com": 4, "b@x.com": 2, "c@x.com": 3},
+            {"ts": 100.0, "originDeviceId": "peer-dev"},
+        ))
+        import_accounts(s, str(env))
+        slots = self._slots(s)
+        assert slots["a@x.com"] == "4"
+        assert "local-only@x.com" in slots  # displaced, never lost
+        assert len(slots) == 4
+
+
+class TestSlotOrderStamping:
+    def test_swap_stamps_when_synced(self, temp_home):
+        from claude_swap import slot_order
+        from claude_swap import sync as sync_mod
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@x.com")
+        _seed_account(s, 2, "b@x.com")
+        assert slot_order.load_order(s.backup_dir) is None
+        sync_mod.load_sync_config(s.backup_dir)  # mint deviceId
+        s.swap_accounts("1", "2")
+        rec = slot_order.load_order(s.backup_dir)
+        assert rec is not None
+        assert rec["adoptedFrom"] is None
+
+    def test_no_sync_json_no_stamp(self, temp_home):
+        from claude_swap import slot_order
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@x.com")
+        _seed_account(s, 2, "b@x.com")
+        s.swap_accounts("1", "2")
+        assert slot_order.load_order(s.backup_dir) is None
+
+    def test_suppression_flag_blocks_stamp(self, temp_home):
+        from claude_swap import slot_order
+        from claude_swap import sync as sync_mod
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@x.com")
+        _seed_account(s, 2, "b@x.com")
+        sync_mod.load_sync_config(s.backup_dir)
+        s._suppress_order_stamp = True
+        s.swap_accounts("1", "2")
+        assert slot_order.load_order(s.backup_dir) is None
