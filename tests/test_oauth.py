@@ -1377,3 +1377,47 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestFresherGeneration:
+    """expiresAt-ordered generation comparison for cross-device freshening."""
+
+    @staticmethod
+    def _creds(expires_at=None, refresh="rt", omit_expiry=False):
+        payload = {"refreshToken": refresh, "accessToken": "at"}
+        if not omit_expiry:
+            payload["expiresAt"] = expires_at
+        return json.dumps({"claudeAiOauth": payload})
+
+    def test_strictly_newer_wins(self):
+        assert oauth.is_fresher_generation(self._creds(2000), self._creds(1000))
+
+    def test_older_and_equal_lose(self):
+        assert not oauth.is_fresher_generation(self._creds(1000), self._creds(2000))
+        assert not oauth.is_fresher_generation(self._creds(1000), self._creds(1000))
+
+    def test_missing_incoming_expiry_never_replaces(self):
+        assert not oauth.is_fresher_generation(
+            self._creds(omit_expiry=True), self._creds(1000)
+        )
+        assert not oauth.is_fresher_generation(
+            self._creds(expires_at=True), self._creds(1000)
+        )
+
+    def test_missing_local_expiry_loses_to_real_one(self):
+        assert oauth.is_fresher_generation(
+            self._creds(2000), self._creds(omit_expiry=True)
+        )
+
+    def test_api_keys_and_garbage_never_participate(self):
+        api_key = "sk-ant-api03-xyz"
+        assert not oauth.is_fresher_generation(api_key, self._creds(1000))
+        assert not oauth.is_fresher_generation(self._creds(2000), api_key)
+        assert not oauth.is_fresher_generation("{not json", self._creds(1000))
+        assert not oauth.is_fresher_generation(self._creds(2000), "{not json")
+        assert not oauth.is_fresher_generation(self._creds(2000), "")
+
+    def test_expires_at_extractor(self):
+        assert oauth.credential_expires_at(self._creds(1500)) == 1500
+        assert oauth.credential_expires_at("sk-ant-api03-xyz") is None
+        assert oauth.credential_expires_at(self._creds(omit_expiry=True)) is None

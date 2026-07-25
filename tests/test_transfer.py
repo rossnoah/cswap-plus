@@ -1644,3 +1644,154 @@ class TestImportClearsDeadTokenQuarantine:
                 )[slot]
                 assert not entry.token_dead()
                 assert entry.auth_dead_strikes == 0
+
+
+def _oauth_creds(expires_at: int, refresh: str = "rt-1") -> dict:
+    return {
+        "claudeAiOauth": {
+            "accessToken": f"at-{expires_at}",
+            "refreshToken": refresh,
+            "expiresAt": expires_at,
+        }
+    }
+
+
+def _envelope_for(email: str, creds: dict, num: int = 1) -> str:
+    return json.dumps({
+        "version": 1,
+        "encrypted": False,
+        "accounts": [{
+            "number": num,
+            "email": email,
+            "uuid": f"acct-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+            "credentials": creds,
+            "config": {"oauthAccount": {"emailAddress": email}},
+        }],
+    })
+
+
+class TestFreshenedImport:
+    """A strictly newer generation of an existing account replaces the stale
+    copy instead of being skipped (the cross-device logout fix)."""
+
+    def test_fresher_generation_freshens(self, temp_home, capsys):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(1000, "rt-old"))
+        env = temp_home / "env.json"
+        env.write_text(_envelope_for(
+            "user@example.com", _oauth_creds(2000, "rt-new")))
+        import_accounts(switcher, str(env))
+        err = capsys.readouterr().err
+        assert "Freshened user@example.com" in err
+        assert "1 freshened" in err
+        stored = json.loads(
+            switcher._read_account_credentials("1", "user@example.com")
+        )
+        assert stored["claudeAiOauth"]["expiresAt"] == 2000
+
+    def test_staler_and_equal_generations_skip(self, temp_home, capsys):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(2000))
+        env = temp_home / "env.json"
+        for incoming in (1000, 2000):
+            env.write_text(_envelope_for(
+                "user@example.com", _oauth_creds(incoming)))
+            import_accounts(switcher, str(env))
+            assert "Skipped user@example.com" in capsys.readouterr().err
+        stored = json.loads(
+            switcher._read_account_credentials("1", "user@example.com")
+        )
+        assert stored["claudeAiOauth"]["expiresAt"] == 2000
+
+    def test_api_key_accounts_never_freshen(self, temp_home, capsys):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(1000))
+        env = temp_home / "env.json"
+        payload = json.loads(_envelope_for("user@example.com", {}))
+        payload["accounts"][0]["credentials"] = "sk-ant-api03-abcdef"
+        payload["accounts"][0]["kind"] = "api_key"
+        env.write_text(json.dumps(payload))
+        import_accounts(switcher, str(env))
+        assert "Skipped" in capsys.readouterr().err
+
+    def test_freshened_clears_dead_token(self, temp_home):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(1000, "rt-old"))
+        env = temp_home / "env.json"
+        env.write_text(_envelope_for(
+            "user@example.com", _oauth_creds(2000, "rt-new")))
+        with patch.object(
+            switcher._usage_store, "clear_dead_token"
+        ) as clear:
+            import_accounts(switcher, str(env))
+        assert clear.called
+
+
+class TestHealLive:
+    """heal_live force-activates a fresher generation of the live login."""
+
+    def _import_with_live(self, temp_home, live_expiry, incoming_expiry,
+                          heal_live=True):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(live_expiry))
+        env = temp_home / "env.json"
+        env.write_text(_envelope_for(
+            "user@example.com", _oauth_creds(incoming_expiry, "rt-new")))
+        calls = []
+        with patch.object(switcher, "_get_current_account",
+                          return_value=("user@example.com", "")), \
+             patch.object(switcher, "_read_credentials",
+                          return_value=json.dumps(_oauth_creds(live_expiry))), \
+             patch.object(switcher, "switch_to",
+                          side_effect=lambda *a, **k: calls.append((a, k))):
+            import_accounts(switcher, str(env), heal_live=heal_live)
+        return calls
+
+    def test_fresher_than_live_activates(self, temp_home, capsys):
+        calls = self._import_with_live(temp_home, 1000, 2000)
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        assert args[0] == "1"
+        assert kwargs["force"] is True
+        assert kwargs["origin"] == "remote-heal"
+        assert "Healing live login" in capsys.readouterr().err
+
+    def test_not_fresher_than_live_keeps_note(self, temp_home, capsys):
+        # Backup is stale (freshened) but live already rotated past it.
+        calls = self._import_with_live(temp_home, 1500, 2000)
+        # incoming (2000) IS fresher than live (1500) here; use a live copy
+        # that is newest instead:
+        assert len(calls) == 1  # sanity for the shared helper
+        calls = self._import_with_live(temp_home, 3000, 2000)
+        assert calls == []
+
+    def test_without_flag_only_notes(self, temp_home, capsys):
+        calls = self._import_with_live(temp_home, 1000, 2000, heal_live=False)
+        assert calls == []
+        assert "current live login" in capsys.readouterr().err
+
+    def test_heal_failure_never_fails_import(self, temp_home, capsys):
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "user@example.com",
+                      creds=_oauth_creds(1000))
+        env = temp_home / "env.json"
+        env.write_text(_envelope_for(
+            "user@example.com", _oauth_creds(2000, "rt-new")))
+        with patch.object(switcher, "_get_current_account",
+                          return_value=("user@example.com", "")), \
+             patch.object(switcher, "_read_credentials",
+                          return_value=json.dumps(_oauth_creds(1000))), \
+             patch.object(switcher, "switch_to",
+                          side_effect=RuntimeError("keychain sad")):
+            import_accounts(switcher, str(env), heal_live=True)
+        err = capsys.readouterr().err
+        assert "live-login heal failed" in err
+        assert "--switch-to 1 --force" in err

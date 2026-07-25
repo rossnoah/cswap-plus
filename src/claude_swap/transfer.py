@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
+from claude_swap import oauth as oauth_mod
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -297,6 +298,8 @@ def import_accounts(
     switcher: ClaudeAccountSwitcher,
     source: str,
     force: bool = False,
+    *,
+    heal_live: bool = False,
 ) -> None:
     """Import accounts from a JSON file or stdin.
 
@@ -306,7 +309,15 @@ def import_accounts(
         force: When True, overwrites the existing matching slot in place.
             Without it, existing accounts are skipped — unless the slot is
             quarantined as refresh-token-dead, which a plain import replaces
-            (auto-heal, issue #136).
+            (auto-heal, issue #136), or the incoming credential is a strictly
+            newer generation of the same OAuth account, which is freshened
+            (the cross-device staleness heal).
+        heal_live: When the import freshened the account that is the current
+            live login AND the incoming credential is also fresher than the
+            live bytes, force-activate it so the live store is repaired
+            before its stale refresh token dies. Sync paths opt in; a plain
+            ``cswap import`` keeps the note-only behavior (rewriting a live
+            login from a file without asking is too surprising).
 
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
@@ -425,7 +436,9 @@ def import_accounts(
     skipped = 0
     overwritten = 0
     replaced = 0
+    freshened = 0
     written_slots: set[str] = set()
+    written_creds: dict[str, str] = {}
 
     # Track where the envelope's active account ended up locally. We can't
     # just look up envelope_active in the final account map afterwards: the
@@ -473,6 +486,18 @@ def import_accounts(
                 # triggered by the live store's "no credentials" state, which
                 # isn't attributable to the backup.
                 outcome = "replaced"
+            elif entry["kind"] == "oauth" and oauth_mod.is_fresher_generation(
+                entry["creds_text"],
+                switcher._read_account_credentials(existing_slot, entry["email"])
+                or "",
+            ):
+                # Cross-device staleness heal: the peer's copy of this same
+                # account is a strictly newer generation (its expiresAt
+                # postdates ours). Keeping ours would let it die with
+                # invalid_grant on its next use — adopting a strictly newer
+                # generation of an account we already manage is less
+                # destructive than --force ever is.
+                outcome = "freshened"
             else:
                 _eprint(
                     f"Skipped {entry['email']} (already exists, use --force)"
@@ -543,6 +568,7 @@ def import_accounts(
         if is_envelope_active:
             resolved_active_slot = target_num
         written_slots.add(target_num)
+        written_creds[target_num] = entry["creds_text"]
 
         if outcome == "overwrote":
             _eprint(f"Overwrote {entry['email']} (slot {target_num})")
@@ -555,6 +581,12 @@ def import_accounts(
                 "quarantined: refresh token dead)"
             )
             replaced += 1
+        elif outcome == "freshened":
+            _eprint(
+                f"Freshened {entry['email']} (slot {target_num}): newer "
+                "credential generation from peer"
+            )
+            freshened += 1
         else:
             _eprint(f"Imported {entry['email']} → slot {target_num}")
             imported += 1
@@ -582,16 +614,43 @@ def import_accounts(
     )
     if replaced:
         summary += f", {replaced} replaced (dead token)"
+    if freshened:
+        summary += f", {freshened} freshened"
     _eprint(summary)
 
     # If we just rewrote the stored backup for the account that is the current
     # live login, a plain switch would back the (possibly stale) live
     # credentials up over it (issue #79) — point at the explicit activation
-    # path instead.
+    # path instead. Sync paths pass heal_live to go one step further: when the
+    # imported credential is also strictly fresher than the LIVE bytes, the
+    # live login itself is repaired via forced activation (the direct path
+    # deliberately skips the back-up-current step, so the stale live copy
+    # can't poison the just-freshened backup). This is what stops the next
+    # invalid_grant logout before it happens.
     identity = switcher._get_current_account()
     if identity is not None and final is not None:
         live_slot = switcher._find_account_slot(final, identity[0], identity[1])
         if live_slot is not None and live_slot in written_slots:
+            if heal_live and oauth_mod.is_fresher_generation(
+                written_creds.get(live_slot, ""),
+                switcher._read_credentials() or "",
+            ):
+                _eprint(
+                    f"Healing live login for {identity[0]} (peer has a newer "
+                    "credential generation)"
+                )
+                try:
+                    switcher.switch_to(
+                        live_slot, json_output=True, force=True,
+                        origin="remote-heal",
+                    )
+                except Exception as e:  # never fail the import on the heal
+                    _eprint(
+                        f"Warning: live-login heal failed ({e}); activate "
+                        f"manually with: cswap --switch-to {live_slot} --force"
+                    )
+                else:
+                    return
             _eprint(
                 f"Note: {identity[0]} is your current live login — activate the "
                 f"imported credentials with: cswap --switch-to {live_slot} --force"

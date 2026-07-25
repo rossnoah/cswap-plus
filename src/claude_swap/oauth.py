@@ -59,6 +59,39 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
+def credential_expires_at(credentials: str) -> int | None:
+    """The access-token expiry (ms epoch) of an OAuth credential, else None."""
+    data = extract_oauth_data(credentials)
+    if data is None:
+        return None
+    expires = data.get("expiresAt")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return None
+    return int(expires)
+
+
+def is_fresher_generation(incoming: str, local: str) -> bool:
+    """Whether ``incoming`` is a strictly newer generation of ``local``.
+
+    Every refresh grant stamps a new ``expiresAt`` (issued-at + expires_in),
+    so for two copies of the same account the later expiry is the later
+    generation. The comparison is strict and one-sided on purpose: ties and
+    a missing incoming expiry never replace anything (an ordering inversion
+    from clock skew merely degrades to today's skip-existing behavior), a
+    missing *local* expiry loses to any real one, and non-OAuth credentials
+    (API keys — no rotation, nothing to freshen) never participate.
+    """
+    incoming_expiry = credential_expires_at(incoming)
+    if incoming_expiry is None:
+        return False
+    if extract_oauth_data(local) is None:
+        return False
+    local_expiry = credential_expires_at(local)
+    if local_expiry is None:
+        return True
+    return incoming_expiry > local_expiry
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):
