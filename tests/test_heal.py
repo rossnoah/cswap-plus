@@ -289,12 +289,30 @@ class TestDeathHook:
 
         sync_mod.add_peer(tmp_path, "mm")
         sw = HealSwitcher(tmp_path)
+        fp = oauth.credential_fingerprint(sw.creds["1"])
         with patch.object(heal, "spawn_background_heal") as spawn:
-            heal.on_death_detected(sw, [("1", "a@x.com", "")])
+            heal.on_death_detected(sw, [("1", "a@x.com", "", fp)])
         assert spawn.call_count == 1
         state = heal._read_state(tmp_path)
         fps = state["identities"]["a@x.com|"]["deadFingerprints"]
-        assert oauth.credential_fingerprint(sw.creds["1"]) in fps
+        assert fp in fps
+
+    def test_on_death_ledgers_the_failed_fingerprint_not_the_slot(self, tmp_path):
+        """THE race regression: a sync freshen replaces the slot's bytes while
+        the doomed refresh is on the wire. The hook must ledger the
+        fingerprint that failed — fingerprinting the slot's current (working,
+        just-delivered) copy would mark the fleet's only live generation dead
+        and block every future heal of it."""
+        sw = HealSwitcher(tmp_path)
+        dead_fp = oauth.credential_fingerprint(_creds("rt-consumed", 4000))
+        sw.creds["1"] = _creds("rt-freshened-alive", 9000)  # freshen won
+        with patch.object(heal, "spawn_background_heal"):
+            heal.on_death_detected(sw, [("1", "a@x.com", "", dead_fp)])
+        fps = heal._read_state(tmp_path)["identities"]["a@x.com|"][
+            "deadFingerprints"
+        ]
+        assert dead_fp in fps
+        assert oauth.credential_fingerprint(sw.creds["1"]) not in fps
 
     def test_on_death_respects_toggle(self, tmp_path):
         from claude_swap.settings import set_setting
@@ -302,7 +320,7 @@ class TestDeathHook:
         set_setting(tmp_path, "sync.healOnDeath", "false")
         sw = HealSwitcher(tmp_path)
         with patch.object(heal, "spawn_background_heal") as spawn:
-            heal.on_death_detected(sw, [("1", "a@x.com", "")])
+            heal.on_death_detected(sw, [("1", "a@x.com", "", "sha256:dead")])
         assert not spawn.called
 
     def test_spawn_requires_peers(self, tmp_path):

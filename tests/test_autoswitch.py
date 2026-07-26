@@ -1531,7 +1531,7 @@ class TestTokenIdentity:
                  "organizationUuid": ""},
             ),
         ):
-            status = harness.engine._freshen_target("2", "b@example.com")
+            status, _ = harness.engine._freshen_target("2", "b@example.com")
         assert status == "ok"
         assert harness.switcher._get_sequence_data()["accounts"]["2"]["uuid"] == (
             "uuid-2-real"
@@ -1559,7 +1559,7 @@ class TestTokenIdentity:
                  "organizationUuid": ""},
             ),
         ):
-            status = harness.engine._freshen_target("2", "b@example.com")
+            status, _ = harness.engine._freshen_target("2", "b@example.com")
         assert status == "identity-conflict"
         # The consumed generation's successor was persisted regardless.
         assert harness.switcher.read_account_credentials(
@@ -1673,7 +1673,7 @@ class TestTokenIdentity:
                  "organizationUuid": "org-other"},
             ),
         ):
-            status = harness.engine._freshen_target("2", "b@example.com")
+            status, _ = harness.engine._freshen_target("2", "b@example.com")
         assert status == "identity-conflict"
 
     def test_malformed_token_identity_never_breaks_freshen(self, harness):
@@ -1697,7 +1697,7 @@ class TestTokenIdentity:
                 fresh, None, {"uuid": 12345, "email": ["weird"]},
             ),
         ):
-            status = harness.engine._freshen_target("2", "b@example.com")
+            status, _ = harness.engine._freshen_target("2", "b@example.com")
         assert status == "ok"
         assert harness.switcher.read_account_credentials(
             "2", "b@example.com"
@@ -1734,7 +1734,7 @@ class TestTokenIdentity:
                  "organizationUuid": "org-B"},
             ),
         ):
-            status = harness.engine._freshen_target("2", "b@example.com")
+            status, _ = harness.engine._freshen_target("2", "b@example.com")
         assert status == "identity-conflict"
         # The foreign uuid was NOT backfilled onto the slot.
         assert harness.switcher._get_sequence_data()["accounts"]["2"]["uuid"] == ""

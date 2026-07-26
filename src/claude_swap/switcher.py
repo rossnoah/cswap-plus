@@ -10,6 +10,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -79,6 +80,7 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -2762,7 +2764,10 @@ class ClaudeAccountSwitcher:
         # the owner-aware path that refreshes only when no Claude Code/session is
         # running and writes the rotated credential back to the active store.
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds)
+            return replace(
+                self._fetch_active_usage(str(num), email, creds),
+                used_fingerprint=oauth.credential_fingerprint(creds),
+            )
 
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
             with FileLock(self.lock_file):
@@ -2809,6 +2814,9 @@ class ClaudeAccountSwitcher:
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        used_fingerprint=oauth.credential_fingerprint(
+                            session_creds
+                        ),
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -2830,6 +2838,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            used_fingerprint=oauth.credential_fingerprint(creds),
         )
 
     def _run_usage_fetches(
@@ -2847,6 +2856,33 @@ class ClaudeAccountSwitcher:
 
         with ThreadPoolExecutor() as executor:
             return dict(executor.map(fetch_one, enumerate(infos)))
+
+    def _attribute_auth_failure(
+        self, num: str, identity: tuple[str, str], record: FetchRecord
+    ) -> FetchRecord:
+        """Strike only the credential that actually answered ``invalid_grant``.
+
+        The fetch read the slot's credential before a network round-trip; a
+        sync freshen, heal, or re-login can replace the slot's bytes while
+        the doomed request is on the wire. The server's verdict condemns the
+        generation that made the request — recording it against the slot
+        would quarantine the just-delivered working credential (and the
+        death hook would ledger it as dead, blocking every future heal).
+        When the slot's current fingerprint no longer matches the one that
+        failed, downgrade to a transient failure: the next poll gets the
+        definitive answer with the current bytes.
+        """
+        if record.error not in PERMANENT_AUTH_ERRORS or not record.used_fingerprint:
+            return record
+        current = self._read_account_credentials(num, identity[0]) or ""
+        if oauth.credential_fingerprint(current) == record.used_fingerprint:
+            return record
+        self._logger.info(
+            "Account %s: %s from a superseded credential generation "
+            "(slot was freshened mid-fetch); not counting a dead strike",
+            num, record.error,
+        )
+        return replace(record, error="refresh-failed")
 
     def _collect_usage_entries(
         self,
@@ -2904,6 +2940,10 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in to_fetch]
             )
+            records = {
+                num: self._attribute_auth_failure(num, identities[num], record)
+                for num, record in records.items()
+            }
             store.record(records, identities)
             for num, record in records.items():
                 if record.sentinel is not None:
@@ -2932,7 +2972,14 @@ class ClaudeAccountSwitcher:
 
                     heal.on_death_detected(
                         self,
-                        [(num, *identities[num]) for num in newly_dead],
+                        [
+                            (
+                                num,
+                                *identities[num],
+                                records[num].used_fingerprint,
+                            )
+                            for num in newly_dead
+                        ],
                     )
                 except Exception as e:
                     self._logger.info(f"heal hand-off skipped: {e}")

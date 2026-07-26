@@ -391,19 +391,22 @@ def heal_all_dead(switcher, *, quiet: bool = True) -> list[HealOutcome]:
     return outcomes
 
 
-def on_death_detected(switcher, items: list[tuple[str, str, str]]) -> None:
+def on_death_detected(
+    switcher, items: list[tuple[str, str, str, str | None]]
+) -> None:
     """Best-effort death hook for interactive surfaces: ledger the dying
     fingerprints, then hand off to a detached heal so no interactive path
-    ever blocks on SSH. ``items`` is [(slot, email, org_uuid)]."""
+    ever blocks on SSH. ``items`` is [(slot, email, org_uuid, fingerprint)],
+    where ``fingerprint`` identifies the credential that actually failed,
+    captured at fetch time. The slot is deliberately NOT re-read here: a
+    sync freshen racing this hook can have already replaced the dead bytes,
+    and fingerprinting the replacement would ledger the fleet's only working
+    generation as dead."""
     try:
         if not load_sync_section_settings(switcher.backup_dir).heal_on_death:
             return
-        for slot, email, org in items:
-            creds = switcher.read_account_credentials(slot, email) or ""
-            note_dead_fingerprint(
-                switcher.backup_dir, email, org,
-                oauth.credential_fingerprint(creds),
-            )
+        for _slot, email, org, fingerprint in items:
+            note_dead_fingerprint(switcher.backup_dir, email, org, fingerprint)
         spawn_background_heal(switcher)
     except Exception as exc:
         _logger.info("death hook skipped: %s", exc)

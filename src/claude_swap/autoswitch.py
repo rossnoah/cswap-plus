@@ -524,9 +524,18 @@ class AutoSwitchEngine:
 
     # -- quarantine -----------------------------------------------------------
 
-    def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
-        fingerprint = _refresh_fingerprint(creds) if creds else None
+    def _quarantine(
+        self, number: str, email: str, reason: str,
+        fingerprint: str | None = None,
+    ) -> None:
+        # ``fingerprint`` names the credential the verdict was reached
+        # against; pass it whenever the caller held those bytes (a network
+        # round-trip separates the verdict from this write, so re-reading
+        # the slot can fingerprint a freshened working copy — which would
+        # both poison the heal ledger and break release-on-change below).
+        if fingerprint is None:
+            creds = self.switcher.read_account_credentials(number, email)
+            fingerprint = _refresh_fingerprint(creds) if creds else None
 
         def add(state: dict) -> None:
             state.setdefault("quarantine", {})[number] = {
@@ -600,19 +609,23 @@ class AutoSwitchEngine:
 
     # -- freshening -----------------------------------------------------------
 
-    def _freshen_target(self, number: str, email: str) -> str:
+    def _freshen_target(self, number: str, email: str) -> tuple[str, str | None]:
         """Ensure a candidate's stored token outlives Claude Code's 5-min
         refresh buffer before it gets activated.
 
-        Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
-        ``"identity-conflict"`` (alive but authenticates as a different
-        account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
-        touches the slot's *backup* store; the active credential belongs to
-        Claude Code.
+        Returns ``(status, dead_fingerprint)``. Status is ``"ok"``,
+        ``"invalid_grant"`` (dead lineage — quarantine), ``"identity-conflict"``
+        (alive but authenticates as a different account — quarantine, do not
+        activate), ``"transient"`` (network trouble — try again next tick) or
+        ``"skip-live-session"``. ``dead_fingerprint`` accompanies
+        ``"invalid_grant"`` only: the fingerprint of the exact credential the
+        verdict was reached against, for the quarantine record — the slot may
+        already hold different (freshened) bytes by the time it is written.
+        Only ever touches the slot's *backup* store; the active credential
+        belongs to Claude Code.
         """
         if self.switcher.account_kind_for(number) == "api_key":
-            return "ok"  # API keys don't expire/refresh
+            return "ok", None  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
@@ -620,13 +633,13 @@ class AutoSwitchEngine:
             # failure class) with nobody reading the warning — and its quota
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
-            return "skip-live-session"
+            return "skip-live-session", None
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:
-            return "transient"
+            return "transient", None
         data = oauth.extract_oauth_data(creds)
         if not data:
-            return "invalid_grant"
+            return "invalid_grant", _refresh_fingerprint(creds)
         expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
         near_expiry = (
@@ -634,7 +647,7 @@ class AutoSwitchEngine:
             and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
-            return "ok"
+            return "ok", None
         outcome = oauth.try_refresh_oauth_credentials(creds)
         if outcome.error is None and outcome.credentials:
             # Persist first, unconditionally: the grant consumed a generation,
@@ -649,11 +662,11 @@ class AutoSwitchEngine:
                 # account with every gauge reading normal. Not a viable
                 # target; the caller quarantines it (released automatically
                 # once the credential is replaced by a re-add).
-                return "identity-conflict"
-            return "ok"
+                return "identity-conflict", None
+            return "ok", None
         if outcome.error in ("invalid_grant", "no_refresh_token"):
-            return "invalid_grant"
-        return "transient"
+            return "invalid_grant", _refresh_fingerprint(creds)
+        return "transient", None
 
     def _note_token_identity(
         self, number: str, token_account: dict | None
@@ -1070,7 +1083,7 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger)
-            status = self._freshen_target(num, email)
+            status, dead_fp = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
                 # account — switching onto it would silently run the wrong
@@ -1079,7 +1092,7 @@ class AutoSwitchEngine:
                 self._quarantine(num, email, "identity-conflict")
                 continue
             if status == "invalid_grant":
-                self._quarantine(num, email, "invalid_grant")
+                self._quarantine(num, email, "invalid_grant", fingerprint=dead_fp)
                 # Inline fleet heal: the engine thread is long-running and
                 # non-interactive, so a bounded SSH round-trip per peer is
                 # acceptable here. A healed slot re-enters rotation next tick

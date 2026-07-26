@@ -7066,3 +7066,62 @@ class TestAnnounceSwitch:
                 warnings_out=warnings_out,
             )
         assert warnings_out and "mm" in warnings_out[0]
+
+
+class TestAuthFailureAttribution:
+    """A permanent-auth verdict belongs to the credential that made the
+    request, not to whatever the slot holds when the verdict lands."""
+
+    @staticmethod
+    def _creds(refresh: str) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": f"at-{refresh}", "refreshToken": refresh,
+            "expiresAt": 9_999_999_999_000,
+        }})
+
+    def test_verdict_against_current_bytes_strikes(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        creds = self._creds("rt-dead")
+        switcher._write_account_credentials("1", "a@x.com", creds)
+        record = FetchRecord(
+            error="invalid_grant",
+            used_fingerprint=oauth.credential_fingerprint(creds),
+        )
+        out = switcher._attribute_auth_failure("1", ("a@x.com", ""), record)
+        assert out.error == "invalid_grant"
+
+    def test_verdict_against_superseded_bytes_is_downgraded(self, temp_home: Path):
+        """THE mid-flight freshen race: a sync delivered a new working
+        generation while the doomed refresh was on the wire. Striking the
+        slot would quarantine the just-delivered credential and hand its
+        fingerprint to the death ledger — the incident this guards against."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._write_account_credentials(
+            "1", "a@x.com", self._creds("rt-freshened-alive")
+        )
+        record = FetchRecord(
+            error="invalid_grant",
+            used_fingerprint=oauth.credential_fingerprint(
+                self._creds("rt-consumed")
+            ),
+        )
+        out = switcher._attribute_auth_failure("1", ("a@x.com", ""), record)
+        assert out.error == "refresh-failed"
+        assert out.used_fingerprint == oauth.credential_fingerprint(
+            self._creds("rt-consumed")
+        )
+
+    def test_record_without_fingerprint_is_left_alone(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        record = FetchRecord(error="invalid_grant")
+        out = switcher._attribute_auth_failure("1", ("a@x.com", ""), record)
+        assert out.error == "invalid_grant"
+
+    def test_transient_errors_pass_through(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        record = FetchRecord(
+            error="http-429", retry_after_s=60.0,
+            used_fingerprint="sha256:whatever",
+        )
+        out = switcher._attribute_auth_failure("1", ("a@x.com", ""), record)
+        assert out is record

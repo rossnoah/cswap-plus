@@ -145,6 +145,12 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    # Fingerprint of the stored credential this fetch started from. A
+    # permanent-auth verdict condemns exactly these bytes — the collector
+    # compares against the slot's *current* fingerprint before striking, so a
+    # slot freshened mid-flight (sync/heal/re-login landed a new generation
+    # while the doomed request was on the wire) never inherits the verdict.
+    used_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
