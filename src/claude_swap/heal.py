@@ -132,6 +132,42 @@ def note_dead_fingerprint(
     _mutate_state(backup_root, add)
 
 
+def note_live_fingerprint(
+    backup_root: Path, email: str, org_uuid: str, fingerprint: str | None
+) -> None:
+    """Drop a fingerprint that just proved alive from the dead ledger.
+
+    A successful fetch outranks any past ``invalid_grant`` verdict (a strike
+    mis-attributed during a racing freshen, a server hiccup): the lineage is
+    demonstrably alive, so un-ledger it and end the identity's heal backoff.
+    This is what makes a poisoned ledger self-correct instead of refusing
+    the fleet's working generation for the 30-day TTL. Lock-free fast path —
+    nearly every poll succeeds against an empty ledger.
+    """
+    if not fingerprint:
+        return
+    key = _identity_key(email, org_uuid)
+    entry = _entry(_read_state(backup_root), key)
+    fps = entry.get("deadFingerprints")
+    ledgered = isinstance(fps, dict) and fingerprint in fps
+    if not ledgered and not entry.get("consecutiveFailures"):
+        return
+
+    def drop(state: dict) -> None:
+        e = state.setdefault("identities", {}).setdefault(key, {})
+        d = e.get("deadFingerprints")
+        if isinstance(d, dict):
+            d.pop(fingerprint, None)
+        e["consecutiveFailures"] = 0
+        e["lastOutcome"] = "proven-live"
+
+    _mutate_state(backup_root, drop)
+    if ledgered:
+        _logger.info(
+            "heal %s: fingerprint proved alive, removed from dead ledger", email
+        )
+
+
 def _quarantine_fingerprint(backup_root: Path, slot: str) -> str | None:
     """The dead fingerprint autoswitch recorded for a slot, if any."""
     try:

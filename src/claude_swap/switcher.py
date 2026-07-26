@@ -2884,6 +2884,34 @@ class ClaudeAccountSwitcher:
         )
         return replace(record, error="refresh-failed")
 
+    def _prove_fingerprints_alive(
+        self, records: dict[str, FetchRecord], identities: dict[str, tuple[str, str]]
+    ) -> None:
+        """Un-ledger every fingerprint a successful fetch just proved alive.
+
+        The heal ledger's job is refusing to re-adopt proven-dead
+        generations; a success outranks any past invalid_grant verdict (a
+        mis-attributed strike, a server hiccup), so this is what makes a
+        poisoned ledger self-correct instead of blocking heals for the
+        30-day TTL. Best-effort: ledger upkeep must never fail a poll.
+        """
+        try:
+            from claude_swap import heal
+
+            for num, record in records.items():
+                if (
+                    record.error is None
+                    and record.sentinel is None
+                    and record.used_fingerprint
+                ):
+                    heal.note_live_fingerprint(
+                        self.backup_dir,
+                        *identities[num],
+                        record.used_fingerprint,
+                    )
+        except Exception as e:
+            self._logger.info(f"live-fingerprint ledger upkeep skipped: {e}")
+
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -2945,6 +2973,7 @@ class ClaudeAccountSwitcher:
                 for num, record in records.items()
             }
             store.record(records, identities)
+            self._prove_fingerprints_alive(records, identities)
             for num, record in records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel

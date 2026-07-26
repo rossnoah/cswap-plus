@@ -328,3 +328,42 @@ class TestDeathHook:
         with patch.object(heal.subprocess, "Popen") as popen:
             assert heal.spawn_background_heal(sw) is False
         assert not popen.called
+
+
+class TestLiveFingerprint:
+    def test_proven_live_fingerprint_leaves_the_ledger(self, tmp_path):
+        (tmp_path / "cache").mkdir(exist_ok=True)
+        heal.note_dead_fingerprint(tmp_path, "a@x.com", "", "sha256:poisoned")
+        heal.note_live_fingerprint(tmp_path, "a@x.com", "", "sha256:poisoned")
+        entry = heal._read_state(tmp_path)["identities"]["a@x.com|"]
+        assert "sha256:poisoned" not in entry.get("deadFingerprints", {})
+        assert entry["lastOutcome"] == "proven-live"
+
+    def test_success_ends_the_heal_backoff(self, tmp_path):
+        (tmp_path / "cache").mkdir(exist_ok=True)
+
+        def fail(state):
+            entry = state.setdefault("identities", {}).setdefault("a@x.com|", {})
+            entry["consecutiveFailures"] = 5
+
+        heal._mutate_state(tmp_path, fail)
+        heal.note_live_fingerprint(tmp_path, "a@x.com", "", "sha256:whatever")
+        entry = heal._read_state(tmp_path)["identities"]["a@x.com|"]
+        assert entry["consecutiveFailures"] == 0
+
+    def test_quiet_path_writes_nothing(self, tmp_path):
+        """Nearly every poll succeeds against an empty ledger — that path
+        must not create state or take the lock-write round-trip."""
+        (tmp_path / "cache").mkdir(exist_ok=True)
+        heal.note_live_fingerprint(tmp_path, "a@x.com", "", "sha256:fine")
+        assert not heal.heal_state_path(tmp_path).exists()
+
+    def test_other_dead_fingerprints_stay_ledgered(self, tmp_path):
+        (tmp_path / "cache").mkdir(exist_ok=True)
+        heal.note_dead_fingerprint(tmp_path, "a@x.com", "", "sha256:really-dead")
+        heal.note_dead_fingerprint(tmp_path, "a@x.com", "", "sha256:poisoned")
+        heal.note_live_fingerprint(tmp_path, "a@x.com", "", "sha256:poisoned")
+        fps = heal._read_state(tmp_path)["identities"]["a@x.com|"][
+            "deadFingerprints"
+        ]
+        assert "sha256:really-dead" in fps and "sha256:poisoned" not in fps
