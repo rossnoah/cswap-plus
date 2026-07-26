@@ -1622,3 +1622,88 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
+
+
+class TestHealSessionProfile:
+    """switcher.heal_session_profile: in-place reseed of a session profile
+    holding a known-dead credential generation."""
+
+    HEALED = json.dumps({"claudeAiOauth": {
+        "accessToken": "healed-access", "refreshToken": "healed-refresh",
+        "expiresAt": 9_999_999_999_000,
+    }})
+
+    def _make_profile(self, switcher, creds=CREDS, email=ACCOUNT_EMAIL,
+                      org=ORG_UUID):
+        session_dir = switcher._session_dir(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(creds, encoding="utf-8")
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "organizationUuid": org},
+        }), encoding="utf-8")
+        return session_dir
+
+    def _dead_fps(self, creds):
+        return {oauth.credential_fingerprint(creds)}
+
+    def test_dead_profile_credential_is_reseeded(self, seeded_switcher):
+        session_dir = self._make_profile(seeded_switcher)
+        healed = seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),
+        )
+        assert healed is True
+        assert (session_dir / ".credentials.json").read_text() == self.HEALED
+
+    def test_reseed_clears_shadowing_keychain_entry(
+        self, seeded_switcher, block_real_keychain
+    ):
+        """Claude reads the hashed keychain entry before the plaintext file,
+        so a dead entry left in place would shadow the healed seed."""
+        session_dir = self._make_profile(seeded_switcher)
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, CREDS)
+        healed = seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),
+        )
+        assert healed is True
+        assert block_real_keychain.get_password(service, account) is None
+
+    def test_alive_family_is_never_clobbered(self, seeded_switcher):
+        """The rotated session family is the account's freshest truth."""
+        session_dir = self._make_profile(seeded_switcher, creds=ROTATED_CREDS)
+        healed = seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),  # dead set names the OLD generation only
+        )
+        assert healed is False
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_drifted_profile_is_not_this_identitys_to_touch(self, seeded_switcher):
+        """An in-session /login re-pointed the profile at another account."""
+        session_dir = self._make_profile(
+            seeded_switcher, email="other@example.com", org="org-other"
+        )
+        healed = seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),
+        )
+        assert healed is False
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_missing_profile_is_a_noop(self, seeded_switcher):
+        assert seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),
+        ) is False
+
+    def test_already_healed_generation_is_a_noop(self, seeded_switcher):
+        session_dir = self._make_profile(seeded_switcher, creds=self.HEALED)
+        before = (session_dir / ".credentials.json").stat().st_mtime_ns
+        assert seeded_switcher.heal_session_profile(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID, self.HEALED,
+            self._dead_fps(CREDS),
+        ) is False
+        assert (session_dir / ".credentials.json").stat().st_mtime_ns == before

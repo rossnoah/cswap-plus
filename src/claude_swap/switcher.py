@@ -1652,6 +1652,49 @@ class ClaudeAccountSwitcher:
 
         return session_dir_for(self.backup_dir, account_num, email)
 
+    def heal_session_profile(
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        creds_text: str,
+        dead_fingerprints: set[str],
+    ) -> bool:
+        """Reseed the slot's session profile with a healed credential — but
+        only when that is what the profile needs.
+
+        The profile is repaired only when its current credential is a
+        known-dead generation: an alive session family is the account's
+        freshest truth (claude rotates it in place) and must never be
+        clobbered, and a profile ``/login``'d into a different account is
+        not this identity's to touch. Returns True when the reseed happened.
+        """
+        from claude_swap.session import (
+            read_session_credentials,
+            reseed_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        current = read_session_credentials(session_dir)
+        if current is None:
+            # No profile or nothing readable: the backup write already
+            # invalidated the profile, so the next `cswap run` re-bootstraps.
+            return False
+        if session_identity_drifted(session_dir, email, org_uuid):
+            return False
+        current_fp = oauth.credential_fingerprint(current)
+        if current_fp == oauth.credential_fingerprint(creds_text):
+            return False  # already on the healed generation
+        if current_fp and current_fp not in dead_fingerprints:
+            return False  # alive family — claude's copy is the freshest truth
+        reseed_session_credentials(session_dir, creds_text)
+        self._logger.info(
+            f"Reseeded session profile for account {account_num} "
+            "with a healed credential"
+        )
+        return True
+
     def _token_status_lines(
         self, account_info: tuple[int, str, str, str, bool, str, str]
     ) -> list[str]:

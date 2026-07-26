@@ -54,8 +54,10 @@ class HealOutcome:
     """One heal attempt's result.
 
     ``healed-live`` means the adopted generation was also force-activated
-    as the live login; ``healed`` with a live session running notes the
-    skipped activation in ``detail``.
+    as the live login. ``detail`` narrates the running-surface repairs: a
+    running ``cswap run`` session whose profile held the dead generation is
+    reseeded in place, and a live login (or session) already holding a
+    working credential is deliberately left as-is.
     """
 
     status: str  # healed | healed-live | no-peers | no-donor | cooldown
@@ -331,28 +333,58 @@ def heal_from_peers(
 
         _mutate_state(backup_root, succeed)
 
+        # In-place repair of running surfaces. A running Claude picks up a
+        # swapped credential store fine — its next credential read finds the
+        # new bytes — so a live instance is a reason to repair, not to skip.
+        # Each store is only touched when it actually holds a known-dead
+        # generation: an out-of-band re-login or an alive session family is
+        # working credential material this heal must never clobber.
+        notes: list[str] = []
+
+        # The slot's `cswap run` session profile: a non-running profile is
+        # already invalidated by the backup write above (the next run
+        # re-bootstraps from the healed backup); a running one is reseeded
+        # in place so the live instance comes back without a restart.
+        if switcher.live_session_pids_for(slot, email):
+            try:
+                if switcher.heal_session_profile(
+                    slot, email, org_uuid, creds_text, dead_fps
+                ):
+                    notes.append("running session reseeded")
+                else:
+                    notes.append("running session credential not dead; left as-is")
+            except Exception as exc:
+                notes.append(f"session reseed failed: {exc}")
+
         # Live-login repair: when this identity IS the live login, land the
         # working generation in the live store too, before the stale copy
-        # dies in Claude Code's hands. A live `cswap run` session owning the
-        # slot skips only this activation step.
+        # dies in Claude Code's hands.
         if activate_live and switcher._get_current_account() == (email, org_uuid):
-            if switcher.live_session_pids_for(slot, email):
-                return done(HealOutcome(
-                    "healed", host=host, fingerprint=new_fp,
-                    detail="backup healed; live session active, not activated",
-                ))
-            try:
-                switcher.switch_to(
-                    slot, json_output=True, force=True, origin="remote-heal"
-                )
-            except Exception as exc:
-                return done(HealOutcome(
-                    "healed", host=host, fingerprint=new_fp,
-                    detail=f"backup healed; live activation failed: {exc}",
-                ))
-            return done(HealOutcome("healed-live", host=host, fingerprint=new_fp))
+            live_fp = oauth.credential_fingerprint(
+                switcher._read_credentials() or ""
+            )
+            if live_fp == new_fp:
+                notes.append("live login already on the healed generation")
+            elif live_fp and live_fp not in dead_fps:
+                # E.g. the user already re-logged the running instance in by
+                # hand: that fresh grant is the one store that provably
+                # works. Activation would replace it for no benefit.
+                notes.append("live login holds a working credential; left as-is")
+            else:
+                try:
+                    switcher.switch_to(
+                        slot, json_output=True, force=True, origin="remote-heal"
+                    )
+                    return done(HealOutcome(
+                        "healed-live", host=host, fingerprint=new_fp,
+                        detail="; ".join(notes),
+                    ))
+                except Exception as exc:
+                    notes.append(f"live activation failed: {exc}")
 
-        return done(HealOutcome("healed", host=host, fingerprint=new_fp))
+        return done(HealOutcome(
+            "healed", host=host, fingerprint=new_fp, detail="; ".join(notes)
+        ))
     except Exception as exc:  # a heal must never take its caller down
         _logger.warning("heal %s failed: %s", email, exc)
         return HealOutcome("error", detail=str(exc))

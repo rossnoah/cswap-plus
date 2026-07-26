@@ -48,6 +48,9 @@ class HealSwitcher:
         self.current = current  # (email, org) or None
         self.switch_calls = []
         self.cleared = []
+        self.live_creds = None  # the live store (default profile) bytes
+        self.session_heal_calls = []
+        self.session_heal_result = True
         self.accounts = {"1": {"email": "a@x.com", "organizationUuid": ""}}
         self._usage_store = self
 
@@ -76,8 +79,15 @@ class HealSwitcher:
     def _get_current_account(self):
         return self.current
 
+    def _read_credentials(self):
+        return self.live_creds
+
     def live_session_pids_for(self, slot, email):
         return []
+
+    def heal_session_profile(self, slot, email, org_uuid, creds_text, dead_fps):
+        self.session_heal_calls.append((slot, email, org_uuid, creds_text))
+        return self.session_heal_result
 
     def switch_to(self, slot, json_output=False, force=False, origin="manual"):
         self.switch_calls.append((slot, force, origin))
@@ -222,15 +232,63 @@ class TestLiveActivation:
         assert out.status == "healed-live"
         assert sw.switch_calls == [("1", True, "remote-heal")]
 
-    def test_live_session_skips_activation_only(self, tmp_path):
+    def test_running_session_is_reseeded_and_live_still_activated(self, tmp_path):
+        """A running instance is a reason to repair, not to skip: the
+        session profile is reseeded in place AND the live login is still
+        activated — both surfaces held the dead generation."""
         sw = HealSwitcher(tmp_path, current=("a@x.com", ""))
         sw.live_session_pids_for = lambda slot, email: [1234]
+        donor = _creds("rt-alive", 9000)
+        with patch.object(heal, "_run_remote",
+                          return_value=_proc(0, _envelope("a@x.com", donor))):
+            out = heal.heal_from_peers(sw, "a@x.com", "", hosts=("mm",))
+        assert out.status == "healed-live"
+        assert sw.switch_calls == [("1", True, "remote-heal")]
+        assert sw.session_heal_calls == [("1", "a@x.com", "", donor)]
+        assert "running session reseeded" in out.detail
+
+    def test_running_session_with_alive_family_noted_not_reseeded(self, tmp_path):
+        sw = HealSwitcher(tmp_path)
+        sw.live_session_pids_for = lambda slot, email: [1234]
+        sw.session_heal_result = False  # switcher judged the family alive
         donor = _envelope("a@x.com", _creds("rt-alive", 9000))
         with patch.object(heal, "_run_remote", return_value=_proc(0, donor)):
             out = heal.heal_from_peers(sw, "a@x.com", "", hosts=("mm",))
         assert out.status == "healed"
-        assert "live session" in out.detail
+        assert "not dead; left as-is" in out.detail
+
+    def test_live_login_with_working_credential_left_untouched(self, tmp_path):
+        """An out-of-band re-login already fixed the running instance: its
+        fresh grant is the one credential that provably works — activation
+        must not replace it with the peer's copy."""
+        sw = HealSwitcher(tmp_path, current=("a@x.com", ""))
+        sw.live_creds = _creds("rt-relogin-fresh", 8000)
+        donor = _envelope("a@x.com", _creds("rt-alive", 9000))
+        with patch.object(heal, "_run_remote", return_value=_proc(0, donor)):
+            out = heal.heal_from_peers(sw, "a@x.com", "", hosts=("mm",))
+        assert out.status == "healed"
         assert sw.switch_calls == []
+        assert "working credential; left as-is" in out.detail
+
+    def test_live_login_holding_the_dead_generation_is_activated(self, tmp_path):
+        sw = HealSwitcher(tmp_path, current=("a@x.com", ""))
+        sw.live_creds = sw.creds["1"]  # live store = the dead backup copy
+        donor = _envelope("a@x.com", _creds("rt-alive", 9000))
+        with patch.object(heal, "_run_remote", return_value=_proc(0, donor)):
+            out = heal.heal_from_peers(sw, "a@x.com", "", hosts=("mm",))
+        assert out.status == "healed-live"
+        assert sw.switch_calls == [("1", True, "remote-heal")]
+
+    def test_live_login_already_on_healed_generation_not_reactivated(self, tmp_path):
+        sw = HealSwitcher(tmp_path, current=("a@x.com", ""))
+        donor = _creds("rt-alive", 9000)
+        sw.live_creds = donor  # a concurrent repair already landed it
+        with patch.object(heal, "_run_remote",
+                          return_value=_proc(0, _envelope("a@x.com", donor))):
+            out = heal.heal_from_peers(sw, "a@x.com", "", hosts=("mm",))
+        assert out.status == "healed"
+        assert sw.switch_calls == []
+        assert "already on the healed generation" in out.detail
 
     def test_activation_failure_still_reports_healed(self, tmp_path):
         sw = HealSwitcher(tmp_path, current=("a@x.com", ""))

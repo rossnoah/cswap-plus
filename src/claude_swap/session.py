@@ -231,6 +231,29 @@ def read_session_credentials(session_dir: Path) -> str | None:
         return None
 
 
+def reseed_session_credentials(session_dir: Path, creds_text: str) -> None:
+    """Land a healed credential in an existing session profile, in place.
+
+    Same write path as bootstrap seeding: drop the profile's hashed keychain
+    entry (Claude reads the keychain before the plaintext file, so the stale
+    entry would shadow the seed) and write the plaintext
+    ``.credentials.json``; Claude migrates it back into its keychain entry on
+    its next write. Safe under a running instance: callers only reseed a
+    profile whose credential is a known-dead generation, so the running
+    claude's copy cannot rotate out from under the seed (a dead grant
+    refuses to refresh) — its next credential read just finds the working
+    bytes. This is a credential-only re-seed, never a profile bootstrap:
+    the caller guarantees the profile exists and matches the identity.
+    """
+    if not session_dir.is_dir():
+        raise SessionError(f"no session profile at {session_dir}")
+    delete_macos_keychain_entry(session_dir)
+    creds_path = session_dir / ".credentials.json"
+    creds_path.write_text(creds_text, encoding="utf-8")
+    if sys.platform != "win32":
+        os.chmod(creds_path, 0o600)
+
+
 def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     """Best-effort read of the account identity a session profile is logged in as.
 
